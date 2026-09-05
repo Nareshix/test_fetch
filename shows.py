@@ -75,7 +75,7 @@ def build_shows_database():
         SELECT
             e.tconst AS episode_id,
             e.parentTconst AS show_id,
-            TRY_CAST(e.seasonNumber AS INTEGER) AS season_number
+            COALESCE(TRY_CAST(e.seasonNumber AS INTEGER), 0) AS season_number
         FROM read_csv('title.episode.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True) e
         WHERE e.parentTconst IN (SELECT show_id FROM show_basics)
     ),
@@ -160,7 +160,9 @@ def build_shows_database():
     shows_data = conn_duck.execute(shows_query).fetchall()
     print(f"Extracted {len(shows_data):,} TV shows.")
 
-    print("\nStep 2/2: Extracting season-level aggregations...")
+    print(
+        "\nStep 2/2: Extracting season-level aggregations (including Season 0 Specials)..."
+    )
     seasons_query = """
     WITH show_ids AS (
         SELECT tconst AS show_id
@@ -171,12 +173,9 @@ def build_shows_database():
         SELECT
             e.tconst AS episode_id,
             e.parentTconst AS show_id,
-            TRY_CAST(e.seasonNumber AS INTEGER) AS season_number,
-            TRY_CAST(e.episodeNumber AS INTEGER) AS episode_number
+            COALESCE(TRY_CAST(e.seasonNumber AS INTEGER), 0) AS season_number
         FROM read_csv('title.episode.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True) e
         WHERE e.parentTconst IN (SELECT show_id FROM show_ids)
-          AND TRY_CAST(e.seasonNumber AS INTEGER) IS NOT NULL
-          AND TRY_CAST(e.seasonNumber AS INTEGER) > 0
     ),
     ratings AS (
         SELECT
@@ -188,7 +187,7 @@ def build_shows_database():
     SELECT
         e.show_id,
         e.season_number,
-        COUNT(e.episode_number) AS season_total_episodes,
+        COUNT(e.episode_id) AS season_total_episodes,
         ROUND(AVG(r.rating), 2) AS season_rating,
         SUM(r.vote_count) AS season_vote_count
     FROM episodes e
@@ -251,6 +250,8 @@ def build_shows_database():
     cursor.executemany("INSERT INTO seasons VALUES (?, ?, ?, ?, ?)", seasons_data)
 
     print("Creating indexes...")
+    cursor.execute("CREATE INDEX idx_shows_title ON shows(title)")
+    cursor.execute("CREATE INDEX idx_shows_original_title ON shows(original_title)")
     cursor.execute("CREATE INDEX idx_shows_start_year ON shows(start_year)")
     cursor.execute("CREATE INDEX idx_shows_rating ON shows(rating)")
     cursor.execute("CREATE INDEX idx_seasons_show_id ON seasons(show_id)")
@@ -259,7 +260,9 @@ def build_shows_database():
     conn_sqlite.close()
     conn_duck.close()
 
-    print("\nFinished! Database ready at shows.db with tables: 'shows' and 'seasons'")
+    print(
+        "\nFinished! Database ready at shows.db with fast title indexing and Season 0 specials included."
+    )
 
 
 if __name__ == "__main__":
