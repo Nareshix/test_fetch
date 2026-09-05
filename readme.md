@@ -1,0 +1,14 @@
+- imdb_id
+- year (imdb)
+- runtime (imdb)
+- title (imdb)
+- rating (imdb)
+- vote_count (imdb)
+- status
+- genres (imdb)
+- description
+- casts (imdb partial?)
+- crews (imdb partial?)
+- prod studio
+- imdb recs
+- tmdb recs
