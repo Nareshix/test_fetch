@@ -45,3 +45,7 @@
 - prod studio
 - imdb recs
 - tmdb recs
+
+## Anime
+
+## People

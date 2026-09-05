@@ -45,7 +45,7 @@ def build_shows_database():
     conn_duck = duckdb.connect()
     conn_duck.execute("SET enable_progress_bar = true;")
 
-    print("\nStep 1/2: Extracting show-level metadata & aggregated crew...")
+    print("\nStep 1/2: Extracting show-level metadata & cast with characters...")
     shows_query = """
     WITH all_basics AS (
         SELECT
@@ -103,34 +103,57 @@ def build_shows_database():
             p.nconst,
             p.category,
             p.job,
+            p.characters,
             n.primaryName AS name
         FROM read_csv('title.principals.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True) p
         JOIN read_csv('name.basics.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True) n
             ON p.nconst = n.nconst
         WHERE p.tconst IN (SELECT show_id FROM show_basics)
     ),
-    ranked_principals AS (
+    distinct_principals AS (
         SELECT
             show_id,
+            ordering,
             nconst,
             name,
             category,
             job,
+            characters,
+            ROW_NUMBER() OVER (
+                PARTITION BY show_id, category, nconst
+                ORDER BY ordering
+            ) AS dup_rank
+        FROM principals
+    ),
+    ranked_principals AS (
+        SELECT
+            show_id,
+            ordering,
+            nconst,
+            name,
+            category,
+            job,
+            CASE
+                WHEN characters IS NOT NULL AND characters != '' AND characters != '[]' THEN
+                    name || ' (as ' || replace(replace(replace(replace(characters, '["', ''), '"]', ''), '","', ', '), '", "', ', ') || ')'
+                ELSE name
+            END AS actor_display,
             ROW_NUMBER() OVER (
                 PARTITION BY show_id, (category IN ('actor', 'actress'))
                 ORDER BY ordering
             ) AS cast_rank
-        FROM principals
+        FROM distinct_principals
+        WHERE dup_rank = 1
     ),
     crew_agg AS (
         SELECT
             show_id,
-            string_agg(name, ', ') FILTER (WHERE category = 'writer' OR LOWER(job) LIKE '%creator%') AS creators,
-            string_agg(nconst, ', ') FILTER (WHERE category = 'writer' OR LOWER(job) LIKE '%creator%') AS creator_ids,
-            string_agg(name, ', ') FILTER (WHERE category IN ('actor', 'actress') AND cast_rank <= 6) AS casts,
-            string_agg(nconst, ', ') FILTER (WHERE category IN ('actor', 'actress') AND cast_rank <= 6) AS casts_id,
-            string_agg(name, ', ') FILTER (WHERE category NOT IN ('actor', 'actress')) AS crews,
-            string_agg(nconst, ', ') FILTER (WHERE category NOT IN ('actor', 'actress')) AS crews_id
+            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category = 'writer' OR LOWER(job) LIKE '%creator%') AS creators,
+            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category = 'writer' OR LOWER(job) LIKE '%creator%') AS creator_ids,
+            string_agg(actor_display, ', ' ORDER BY ordering) FILTER (WHERE category IN ('actor', 'actress') AND cast_rank <= 6) AS casts,
+            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category IN ('actor', 'actress') AND cast_rank <= 6) AS casts_id,
+            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category NOT IN ('actor', 'actress')) AS crews,
+            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category NOT IN ('actor', 'actress')) AS crews_id
         FROM ranked_principals
         GROUP BY show_id
     )
@@ -260,9 +283,7 @@ def build_shows_database():
     conn_sqlite.close()
     conn_duck.close()
 
-    print(
-        "\nFinished! Database ready at shows.db with fast title indexing and Season 0 specials included."
-    )
+    print("\nFinished! Database ready at shows.db")
 
 
 if __name__ == "__main__":

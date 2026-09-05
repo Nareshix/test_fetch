@@ -40,7 +40,7 @@ def download_files():
 def build_movies_db():
     download_files()
 
-    print("\nInitializing DuckDB engine...")
+    print("\nConnecting to DuckDB engine...")
     conn_duck = duckdb.connect()
     conn_duck.execute("SET enable_progress_bar = true;")
 
@@ -69,6 +69,7 @@ def build_movies_db():
             TRY_CAST(p.ordering AS INTEGER) AS ordering,
             p.nconst,
             p.category,
+            p.characters,
             n.primaryName AS name
         FROM read_csv('title.principals.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True) p
         JOIN read_csv('name.basics.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True) n
@@ -76,35 +77,56 @@ def build_movies_db():
         WHERE p.tconst IN (SELECT tconst FROM movie_basics)
           AND p.category IN ('actor', 'actress', 'director', 'writer', 'producer', 'composer', 'cinematographer', 'editor')
     ),
-    ranked_principals AS (
+    distinct_principals AS (
         SELECT
             tconst,
+            ordering,
             nconst,
             name,
             category,
+            characters,
+            ROW_NUMBER() OVER (
+                PARTITION BY tconst, category, nconst
+                ORDER BY ordering
+            ) AS dup_rank
+        FROM principals
+    ),
+    ranked_principals AS (
+        SELECT
+            tconst,
+            ordering,
+            nconst,
+            name,
+            category,
+            CASE
+                WHEN characters IS NOT NULL AND characters != '' AND characters != '[]' THEN
+                    name || ' (as ' || replace(replace(replace(replace(characters, '["', ''), '"]', ''), '","', ', '), '", "', ', ') || ')'
+                ELSE name
+            END AS actor_display,
             ROW_NUMBER() OVER (
                 PARTITION BY tconst, (category IN ('actor', 'actress'))
                 ORDER BY ordering
             ) AS cast_rank
-        FROM principals
+        FROM distinct_principals
+        WHERE dup_rank = 1
     ),
     crew_agg AS (
         SELECT
             tconst,
-            string_agg(name, ', ') FILTER (WHERE category IN ('actor', 'actress') AND cast_rank <= 6) AS cast,
-            string_agg(nconst, ', ') FILTER (WHERE category IN ('actor', 'actress') AND cast_rank <= 6) AS cast_ids,
-            string_agg(name, ', ') FILTER (WHERE category = 'director') AS directors,
-            string_agg(nconst, ', ') FILTER (WHERE category = 'director') AS director_ids,
-            string_agg(name, ', ') FILTER (WHERE category = 'writer') AS writers,
-            string_agg(nconst, ', ') FILTER (WHERE category = 'writer') AS writer_ids,
-            string_agg(name, ', ') FILTER (WHERE category = 'producer') AS producers,
-            string_agg(nconst, ', ') FILTER (WHERE category = 'producer') AS producer_ids,
-            string_agg(name, ', ') FILTER (WHERE category = 'composer') AS composers,
-            string_agg(nconst, ', ') FILTER (WHERE category = 'composer') AS composer_ids,
-            string_agg(name, ', ') FILTER (WHERE category = 'cinematographer') AS cinematographers,
-            string_agg(nconst, ', ') FILTER (WHERE category = 'cinematographer') AS cinematographer_ids,
-            string_agg(name, ', ') FILTER (WHERE category = 'editor') AS editors,
-            string_agg(nconst, ', ') FILTER (WHERE category = 'editor') AS editor_ids
+            string_agg(actor_display, ', ' ORDER BY ordering) FILTER (WHERE category IN ('actor', 'actress') AND cast_rank <= 6) AS cast,
+            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category IN ('actor', 'actress') AND cast_rank <= 6) AS cast_ids,
+            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category = 'director') AS directors,
+            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category = 'director') AS director_ids,
+            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category = 'writer') AS writers,
+            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category = 'writer') AS writer_ids,
+            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category = 'producer') AS producers,
+            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category = 'producer') AS producer_ids,
+            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category = 'composer') AS composers,
+            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category = 'composer') AS composer_ids,
+            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category = 'cinematographer') AS cinematographers,
+            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category = 'cinematographer') AS cinematographer_ids,
+            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category = 'editor') AS editors,
+            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category = 'editor') AS editor_ids
         FROM ranked_principals
         GROUP BY tconst
     )
@@ -136,9 +158,9 @@ def build_movies_db():
     LEFT JOIN crew_agg c ON b.tconst = c.tconst
     """
 
-    print("Executing single-pass SQL query directly on compressed files...")
+    print("Executing query directly on compressed files...")
     results = conn_duck.execute(query).fetchall()
-    print(f"\nExtracted {len(results):,} movies successfully.")
+    print(f"\nExtracted {len(results):,} movies.")
 
     print("Writing records to movies.db...")
     if os.path.exists("movies.db"):
@@ -180,9 +202,11 @@ def build_movies_db():
     cursor.executemany(f"INSERT INTO movies VALUES ({placeholders})", results)
 
     print("Creating indexes...")
-    cursor.execute("CREATE INDEX idx_year ON movies(year)")
-    cursor.execute("CREATE INDEX idx_rating ON movies(rating)")
-    cursor.execute("CREATE INDEX idx_vote_count ON movies(vote_count)")
+    cursor.execute("CREATE INDEX idx_movies_title ON movies(title)")
+    cursor.execute("CREATE INDEX idx_movies_original_title ON movies(original_title)")
+    cursor.execute("CREATE INDEX idx_movies_year ON movies(year)")
+    cursor.execute("CREATE INDEX idx_movies_rating ON movies(rating)")
+    cursor.execute("CREATE INDEX idx_movies_vote_count ON movies(vote_count)")
 
     conn_sqlite.commit()
     conn_sqlite.close()
