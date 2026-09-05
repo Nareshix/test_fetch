@@ -3,7 +3,7 @@
 - year (imdb)
 - runtime (imdb)
 - title (imdb)
-- original_title (imdb) (might remove)
+- original_title (imdb) (might remove duplicates)
 - rating (imdb)
 - vote_count (imdb)
 - status
@@ -19,26 +19,28 @@
 
 
 ## Shows
-- imdb_id
-- start_year
-- end_year
-- total_seasons
-- total_episodes
-- total_time_taken_for_all_episodes
+- imdb_id (imdb)
+- title (imdb)
+- original_title (imdb) (might remove duplicates)
+- start_year (imdb)
+- end_year (imdb)
+- total_seasons (imdb)
+- total_episodes (imdb)
+- total_time_taken_for_all_episodes (imdb)
 - status
-- rating
-- vote_count
-- genres
+- rating (imdb)
+- vote_count (imdb)
+- genres (imdb)
 - description
-- season rating
-- season vote_count
-- season total_episodes
-- showrunner and creator
-- showrunner and creator id
-- casts
-- casts_id
-- crews
-- crews_id
+- season rating (imdb)
+- season vote_count (imdb)
+- season total_episodes (imdb)
+- showrunner and creator (imdb)
+- showrunner and creator id (imdb)
+- casts (imdb)
+- casts_id (imdb)
+- crews (imdb)
+- crews_id (imdb)
 - original network
 - prod studio
 - imdb recs

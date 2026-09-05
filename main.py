@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import urllib.request
-import polars as pl
+import duckdb
 
 FILES = [
     "title.basics.tsv.gz",
@@ -40,166 +40,112 @@ def download_files():
 def build_movies_db():
     download_files()
 
-    print("\nProcessing datasets with Polars...")
+    print("\nInitializing DuckDB engine...")
+    conn_duck = duckdb.connect()
+    conn_duck.execute("SET enable_progress_bar = true;")
 
-    basics = (
-        pl.scan_csv(
-            "title.basics.tsv.gz",
-            separator="\t",
-            null_values=["\\N"],
-            quote_char=None,
-        )
-        .filter(pl.col("titleType") == "movie")
-        .select(
-            [
-                pl.col("tconst"),
-                pl.col("primaryTitle").alias("title"),
-                pl.col("originalTitle").alias("original_title"),
-                pl.col("startYear").cast(pl.Int32, strict=False).alias("year"),
-                pl.col("runtimeMinutes")
-                .cast(pl.Int32, strict=False)
-                .alias("runtime_minutes"),
-                pl.col("genres"),
-            ]
-        )
+    query = """
+    WITH movie_basics AS (
+        SELECT
+            tconst,
+            primaryTitle AS title,
+            originalTitle AS original_title,
+            TRY_CAST(startYear AS INTEGER) AS year,
+            TRY_CAST(runtimeMinutes AS INTEGER) AS runtime_minutes,
+            genres
+        FROM read_csv('title.basics.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True)
+        WHERE titleType = 'movie'
+    ),
+    ratings AS (
+        SELECT
+            tconst,
+            TRY_CAST(averageRating AS FLOAT) AS rating,
+            TRY_CAST(numVotes AS INTEGER) AS vote_count
+        FROM read_csv('title.ratings.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True)
+    ),
+    principals AS (
+        SELECT
+            p.tconst,
+            TRY_CAST(p.ordering AS INTEGER) AS ordering,
+            p.nconst,
+            p.category,
+            n.primaryName AS name
+        FROM read_csv('title.principals.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True) p
+        JOIN read_csv('name.basics.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True) n
+            ON p.nconst = n.nconst
+        WHERE p.tconst IN (SELECT tconst FROM movie_basics)
+          AND p.category IN ('actor', 'actress', 'director', 'writer', 'producer', 'composer', 'cinematographer', 'editor')
+    ),
+    ranked_principals AS (
+        SELECT
+            tconst,
+            nconst,
+            name,
+            category,
+            ROW_NUMBER() OVER (
+                PARTITION BY tconst, (category IN ('actor', 'actress'))
+                ORDER BY ordering
+            ) AS cast_rank
+        FROM principals
+    ),
+    crew_agg AS (
+        SELECT
+            tconst,
+            string_agg(name, ', ') FILTER (WHERE category IN ('actor', 'actress') AND cast_rank <= 6) AS cast,
+            string_agg(nconst, ', ') FILTER (WHERE category IN ('actor', 'actress') AND cast_rank <= 6) AS cast_ids,
+            string_agg(name, ', ') FILTER (WHERE category = 'director') AS directors,
+            string_agg(nconst, ', ') FILTER (WHERE category = 'director') AS director_ids,
+            string_agg(name, ', ') FILTER (WHERE category = 'writer') AS writers,
+            string_agg(nconst, ', ') FILTER (WHERE category = 'writer') AS writer_ids,
+            string_agg(name, ', ') FILTER (WHERE category = 'producer') AS producers,
+            string_agg(nconst, ', ') FILTER (WHERE category = 'producer') AS producer_ids,
+            string_agg(name, ', ') FILTER (WHERE category = 'composer') AS composers,
+            string_agg(nconst, ', ') FILTER (WHERE category = 'composer') AS composer_ids,
+            string_agg(name, ', ') FILTER (WHERE category = 'cinematographer') AS cinematographers,
+            string_agg(nconst, ', ') FILTER (WHERE category = 'cinematographer') AS cinematographer_ids,
+            string_agg(name, ', ') FILTER (WHERE category = 'editor') AS editors,
+            string_agg(nconst, ', ') FILTER (WHERE category = 'editor') AS editor_ids
+        FROM ranked_principals
+        GROUP BY tconst
     )
+    SELECT
+        b.tconst,
+        b.title,
+        b.original_title,
+        b.year,
+        b.runtime_minutes,
+        b.genres,
+        r.rating,
+        r.vote_count,
+        c.cast,
+        c.cast_ids,
+        c.directors,
+        c.director_ids,
+        c.writers,
+        c.writer_ids,
+        c.producers,
+        c.producer_ids,
+        c.composers,
+        c.composer_ids,
+        c.cinematographers,
+        c.cinematographer_ids,
+        c.editors,
+        c.editor_ids
+    FROM movie_basics b
+    LEFT JOIN ratings r ON b.tconst = r.tconst
+    LEFT JOIN crew_agg c ON b.tconst = c.tconst
+    """
 
-    ratings = pl.scan_csv(
-        "title.ratings.tsv.gz",
-        separator="\t",
-        null_values=["\\N"],
-        quote_char=None,
-    ).select(
-        [
-            pl.col("tconst"),
-            pl.col("averageRating").cast(pl.Float32, strict=False).alias("rating"),
-            pl.col("numVotes").cast(pl.Int32, strict=False).alias("vote_count"),
-        ]
-    )
-
-    names = pl.scan_csv(
-        "name.basics.tsv.gz",
-        separator="\t",
-        null_values=["\\N"],
-        quote_char=None,
-    ).select(
-        [
-            pl.col("nconst"),
-            pl.col("primaryName").alias("name"),
-        ]
-    )
-
-    movie_principals = (
-        pl.scan_csv(
-            "title.principals.tsv.gz",
-            separator="\t",
-            null_values=["\\N"],
-            quote_char=None,
-        )
-        .select(["tconst", "ordering", "nconst", "category"])
-        .join(basics.select("tconst"), on="tconst", how="inner")
-        .join(names, on="nconst", how="inner")
-    )
-
-    cast_df = (
-        movie_principals.filter(pl.col("category").is_in(["actor", "actress"]))
-        .sort("ordering")
-        .group_by("tconst")
-        .agg(
-            [
-                pl.col("name").head(6).str.join(", ").alias("cast"),
-                pl.col("nconst").head(6).str.join(", ").alias("cast_ids"),
-            ]
-        )
-    )
-
-    directors_df = (
-        movie_principals.filter(pl.col("category") == "director")
-        .group_by("tconst")
-        .agg(
-            [
-                pl.col("name").str.join(", ").alias("directors"),
-                pl.col("nconst").str.join(", ").alias("director_ids"),
-            ]
-        )
-    )
-
-    writers_df = (
-        movie_principals.filter(pl.col("category") == "writer")
-        .group_by("tconst")
-        .agg(
-            [
-                pl.col("name").str.join(", ").alias("writers"),
-                pl.col("nconst").str.join(", ").alias("writer_ids"),
-            ]
-        )
-    )
-
-    producers_df = (
-        movie_principals.filter(pl.col("category") == "producer")
-        .group_by("tconst")
-        .agg(
-            [
-                pl.col("name").str.join(", ").alias("producers"),
-                pl.col("nconst").str.join(", ").alias("producer_ids"),
-            ]
-        )
-    )
-
-    composers_df = (
-        movie_principals.filter(pl.col("category") == "composer")
-        .group_by("tconst")
-        .agg(
-            [
-                pl.col("name").str.join(", ").alias("composers"),
-                pl.col("nconst").str.join(", ").alias("composer_ids"),
-            ]
-        )
-    )
-
-    cinematographers_df = (
-        movie_principals.filter(pl.col("category") == "cinematographer")
-        .group_by("tconst")
-        .agg(
-            [
-                pl.col("name").str.join(", ").alias("cinematographers"),
-                pl.col("nconst").str.join(", ").alias("cinematographer_ids"),
-            ]
-        )
-    )
-
-    editors_df = (
-        movie_principals.filter(pl.col("category") == "editor")
-        .group_by("tconst")
-        .agg(
-            [
-                pl.col("name").str.join(", ").alias("editors"),
-                pl.col("nconst").str.join(", ").alias("editor_ids"),
-            ]
-        )
-    )
-
-    print("Joining tables and executing computation graph...")
-    final_df = (
-        basics.join(ratings, on="tconst", how="left")
-        .join(cast_df, on="tconst", how="left")
-        .join(directors_df, on="tconst", how="left")
-        .join(writers_df, on="tconst", how="left")
-        .join(producers_df, on="tconst", how="left")
-        .join(composers_df, on="tconst", how="left")
-        .join(cinematographers_df, on="tconst", how="left")
-        .join(editors_df, on="tconst", how="left")
-        .collect()
-    )
-
-    print(f"Total movies processed: {final_df.height:,}")
+    print("Executing single-pass SQL query directly on compressed files...")
+    results = conn_duck.execute(query).fetchall()
+    print(f"\nExtracted {len(results):,} movies successfully.")
 
     print("Writing records to movies.db...")
     if os.path.exists("movies.db"):
         os.remove("movies.db")
 
-    conn = sqlite3.connect("movies.db")
-    cursor = conn.cursor()
+    conn_sqlite = sqlite3.connect("movies.db")
+    cursor = conn_sqlite.cursor()
 
     cursor.execute(
         """
@@ -230,18 +176,17 @@ def build_movies_db():
     """
     )
 
-    placeholders = ", ".join(["?"] * len(final_df.columns))
-    cursor.executemany(
-        f"INSERT INTO movies VALUES ({placeholders})", final_df.iter_rows()
-    )
+    placeholders = ", ".join(["?"] * 22)
+    cursor.executemany(f"INSERT INTO movies VALUES ({placeholders})", results)
 
     print("Creating indexes...")
     cursor.execute("CREATE INDEX idx_year ON movies(year)")
     cursor.execute("CREATE INDEX idx_rating ON movies(rating)")
     cursor.execute("CREATE INDEX idx_vote_count ON movies(vote_count)")
 
-    conn.commit()
-    conn.close()
+    conn_sqlite.commit()
+    conn_sqlite.close()
+    conn_duck.close()
     print("Done! Database ready at movies.db")
 
 
