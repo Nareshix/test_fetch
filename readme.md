@@ -3,6 +3,7 @@
 - year (imdb)
 - runtime (imdb)
 - title (imdb)
+- original_title (imdb) (might remove)
 - rating (imdb)
 - vote_count (imdb)
 - status
@@ -21,4 +22,24 @@
 - imdb_id
 - start_year
 - end_year
-- 
+- total_seasons
+- total_episodes
+- total_time_taken_for_all_episodes
+- status
+- rating
+- vote_count
+- genres
+- description
+- season rating
+- season vote_count
+- season total_episodes
+- showrunner and creator
+- showrunner and creator id
+- casts
+- casts_id
+- crews
+- crews_id
+- original network
+- prod studio
+- imdb recs
+- tmdb recs
