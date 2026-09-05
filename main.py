@@ -105,19 +105,78 @@ def build_movies_db():
         movie_principals.filter(pl.col("category").is_in(["actor", "actress"]))
         .sort("ordering")
         .group_by("tconst")
-        .agg(pl.col("name").head(6).str.join(", ").alias("cast"))
+        .agg(
+            [
+                pl.col("name").head(6).str.join(", ").alias("cast"),
+                pl.col("nconst").head(6).str.join(", ").alias("cast_ids"),
+            ]
+        )
     )
 
     directors_df = (
         movie_principals.filter(pl.col("category") == "director")
         .group_by("tconst")
-        .agg(pl.col("name").str.join(", ").alias("directors"))
+        .agg(
+            [
+                pl.col("name").str.join(", ").alias("directors"),
+                pl.col("nconst").str.join(", ").alias("director_ids"),
+            ]
+        )
     )
 
     writers_df = (
         movie_principals.filter(pl.col("category") == "writer")
         .group_by("tconst")
-        .agg(pl.col("name").str.join(", ").alias("writers"))
+        .agg(
+            [
+                pl.col("name").str.join(", ").alias("writers"),
+                pl.col("nconst").str.join(", ").alias("writer_ids"),
+            ]
+        )
+    )
+
+    producers_df = (
+        movie_principals.filter(pl.col("category") == "producer")
+        .group_by("tconst")
+        .agg(
+            [
+                pl.col("name").str.join(", ").alias("producers"),
+                pl.col("nconst").str.join(", ").alias("producer_ids"),
+            ]
+        )
+    )
+
+    composers_df = (
+        movie_principals.filter(pl.col("category") == "composer")
+        .group_by("tconst")
+        .agg(
+            [
+                pl.col("name").str.join(", ").alias("composers"),
+                pl.col("nconst").str.join(", ").alias("composer_ids"),
+            ]
+        )
+    )
+
+    cinematographers_df = (
+        movie_principals.filter(pl.col("category") == "cinematographer")
+        .group_by("tconst")
+        .agg(
+            [
+                pl.col("name").str.join(", ").alias("cinematographers"),
+                pl.col("nconst").str.join(", ").alias("cinematographer_ids"),
+            ]
+        )
+    )
+
+    editors_df = (
+        movie_principals.filter(pl.col("category") == "editor")
+        .group_by("tconst")
+        .agg(
+            [
+                pl.col("name").str.join(", ").alias("editors"),
+                pl.col("nconst").str.join(", ").alias("editor_ids"),
+            ]
+        )
     )
 
     print("Joining tables and executing computation graph...")
@@ -126,6 +185,10 @@ def build_movies_db():
         .join(cast_df, on="tconst", how="left")
         .join(directors_df, on="tconst", how="left")
         .join(writers_df, on="tconst", how="left")
+        .join(producers_df, on="tconst", how="left")
+        .join(composers_df, on="tconst", how="left")
+        .join(cinematographers_df, on="tconst", how="left")
+        .join(editors_df, on="tconst", how="left")
         .collect()
     )
 
@@ -150,15 +213,26 @@ def build_movies_db():
             rating REAL,
             vote_count INTEGER,
             cast TEXT,
+            cast_ids TEXT,
             directors TEXT,
-            writers TEXT
+            director_ids TEXT,
+            writers TEXT,
+            writer_ids TEXT,
+            producers TEXT,
+            producer_ids TEXT,
+            composers TEXT,
+            composer_ids TEXT,
+            cinematographers TEXT,
+            cinematographer_ids TEXT,
+            editors TEXT,
+            editor_ids TEXT
         )
     """
     )
 
+    placeholders = ", ".join(["?"] * len(final_df.columns))
     cursor.executemany(
-        "INSERT INTO movies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        final_df.iter_rows(),
+        f"INSERT INTO movies VALUES ({placeholders})", final_df.iter_rows()
     )
 
     print("Creating indexes...")

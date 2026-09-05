@@ -1,3 +1,4 @@
+## Movie
 - imdb_id
 - year (imdb)
 - runtime (imdb)
@@ -7,8 +8,17 @@
 - status
 - genres (imdb)
 - description
-- casts (imdb partial?)
-- crews (imdb partial?)
+- casts (imdb)
+- casts_id (imdb)
+- crews (imdb)
+- crews_id (imdb)
 - prod studio
 - imdb recs
 - tmdb recs
+
+
+## Shows
+- imdb_id
+- start_year
+- end_year
+- 
