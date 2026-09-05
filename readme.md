@@ -45,6 +45,7 @@
 - prod studio
 - imdb recs
 - tmdb recs
+- Showrunners (missing in imdb, tmdb and wikidata, avail in wikipedia)
 
 ## Anime
 
