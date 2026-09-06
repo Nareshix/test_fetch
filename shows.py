@@ -393,7 +393,7 @@ async def run_scraper():
                 speed = processed / elapsed
                 pct = (processed / total) * 100
                 print(
-                    f"[{SHARD_INDEX}/{SHARD_TOTAL}] Saved: {success_count:,} | Progress: {processed:,}/{total:,} ({pct:4.1f}%) | {speed:4.1f} req/s",
+                    f"[{SHARD_INDEX}/{SHARD_TOTAL-1}] Saved: {success_count:,} | Progress: {processed:,}/{total:,} ({pct:4.1f}%) | {speed:4.1f} req/s",
                     flush=True,
                 )
 
