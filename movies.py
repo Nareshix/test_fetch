@@ -295,15 +295,8 @@ async def run_scraper():
                 elapsed = max(1, time.time() - start_time)
                 speed = processed / elapsed
                 pct = (processed / total) * 100
-                display_title = (
-                    (title[:25] + "...")
-                    if title and len(title) > 25
-                    else (title or "N/A")
-                )
                 print(
-                    f"[Shard {SHARD_INDEX}/{SHARD_TOTAL}] {processed:,}/{total:,} ({pct:5.1f}%) | "
-                    f"{speed:4.1f} req/s | OK: {success_count:,} | Ignored (No IMDb): {no_imdb_count:,} | "
-                    f"404: {not_found_count} | '{display_title}' ({year or '?'})",
+                    f"[{SHARD_INDEX}/{SHARD_TOTAL}] Saved: {success_count:,} | Progress: {processed:,}/{total:,} ({pct:4.1f}%) | {speed:4.1f} req/s",
                     flush=True,
                 )
 
