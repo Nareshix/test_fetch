@@ -109,7 +109,7 @@ async def download_tmdb_tv_dump(session):
     if not downloaded:
         raise RuntimeError("Failed to download any valid TMDB daily TV dump.")
 
-    query = f"SELECT id FROM read_json('{dump_filename}') WHERE adult = false"
+    query = f"SELECT id FROM read_json('{dump_filename}')"
     rows = duckdb.sql(query).fetchall()
     all_tv_ids = [r[0] for r in rows]
 
@@ -139,9 +139,15 @@ async def fetch_show(session, semaphore, show_id, retries=5):
                     if resp.status == 200:
                         data = orjson.loads(await resp.read())
 
+                        # 1. Drop if TMDB marks it as adult
+                        if data.get("adult", False):
+                            return "ADULT", None, [], data.get("name"), None
+
+                        # 2. Drop if no IMDb ID exists
                         imdb_id = data.get("external_ids", {}).get("imdb_id")
                         if not imdb_id or not str(imdb_id).strip():
                             return "NO_IMDB", None, [], data.get("name"), None
+
 
                         credits = data.get("credits", {})
                         cast_list = credits.get("cast", [])
