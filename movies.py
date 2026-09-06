@@ -101,17 +101,41 @@ async def fetch_movie(session, semaphore, movie_id, retries=5):
                             data.get("title"),
                             data.get("original_title"),
                             data.get("status"),
-                            orjson.dumps([g.get("name") for g in data.get("genres", []) if g.get("name")]).decode("utf-8"),
+                            orjson.dumps(
+                                [
+                                    g.get("name")
+                                    for g in data.get("genres", [])
+                                    if g.get("name")
+                                ]
+                            ).decode("utf-8"),
                             data.get("overview"),
-                            orjson.dumps([c.get("name") for c in cast_list]).decode("utf-8"),
-                            orjson.dumps([c.get("id") for c in cast_list]).decode("utf-8"),
-                            orjson.dumps([c.get("profile_path") for c in cast_list]).decode("utf-8"),
-                            orjson.dumps([c.get("name") for c in crew_list]).decode("utf-8"),
-                            orjson.dumps([c.get("id") for c in crew_list]).decode("utf-8"),
-                            orjson.dumps([c.get("profile_path") for c in crew_list]).decode("utf-8"),
-                            orjson.dumps([p.get("name") for p in prod_list]).decode("utf-8"),
-                            orjson.dumps([p.get("id") for p in prod_list]).decode("utf-8"),
-                            orjson.dumps([p.get("logo_path") for p in prod_list]).decode("utf-8"),
+                            orjson.dumps([c.get("name") for c in cast_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([c.get("id") for c in cast_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps(
+                                [c.get("profile_path") for c in cast_list]
+                            ).decode("utf-8"),
+                            orjson.dumps([c.get("name") for c in crew_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([c.get("id") for c in crew_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps(
+                                [c.get("profile_path") for c in crew_list]
+                            ).decode("utf-8"),
+                            orjson.dumps([p.get("name") for p in prod_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([p.get("id") for p in prod_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps(
+                                [p.get("logo_path") for p in prod_list]
+                            ).decode("utf-8"),
                         )
                         return "OK", record, data.get("title"), year
 
@@ -123,10 +147,16 @@ async def fetch_movie(session, semaphore, movie_id, retries=5):
                         async with pause_lock:
                             if pause_event.is_set():
                                 pause_event.clear()
-                                print(f"\n[429] Rate limit hit. Pausing for {retry_after:.1f}s:", flush=True)
+                                print(
+                                    f"\n[429] Rate limit hit. Pausing for {retry_after:.1f}s:",
+                                    flush=True,
+                                )
                                 remaining = retry_after
                                 while remaining > 0:
-                                    print(f"  [429] {remaining:.1f}s remaining...", flush=True)
+                                    print(
+                                        f"  [429] {remaining:.1f}s remaining...",
+                                        flush=True,
+                                    )
                                     step = min(1.0, remaining)
                                     await asyncio.sleep(step)
                                     remaining -= step
@@ -155,11 +185,17 @@ async def writer_worker(queue, db_path=DB_FILE):
             break
         batch.append(record)
         if len(batch) >= 200:
-            conn.executemany("INSERT OR REPLACE INTO movies VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", batch)
+            conn.executemany(
+                "INSERT OR REPLACE INTO movies VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                batch,
+            )
             batch.clear()
 
     if batch:
-        conn.executemany("INSERT OR REPLACE INTO movies VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", batch)
+        conn.executemany(
+            "INSERT OR REPLACE INTO movies VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            batch,
+        )
     conn.close()
 
 
@@ -183,7 +219,10 @@ async def download_tmdb_dump(session):
             if resp.status == 200:
                 with open(dump_filename, "wb") as f:
                     f.write(await resp.read())
-                print(f"[+] [Shard {SHARD_INDEX}] Downloaded dump for {date_str}", flush=True)
+                print(
+                    f"[+] [Shard {SHARD_INDEX}] Downloaded dump for {date_str}",
+                    flush=True,
+                )
                 downloaded = True
                 break
 
@@ -197,8 +236,15 @@ async def download_tmdb_dump(session):
     if os.path.exists(dump_filename):
         os.remove(dump_filename)
 
-    movie_ids = [m_id for idx, m_id in enumerate(all_movie_ids) if idx % SHARD_TOTAL == SHARD_INDEX]
-    print(f"[*] Total non-adult movies: {len(all_movie_ids):,} | Assigned to Shard {SHARD_INDEX}/{SHARD_TOTAL}: {len(movie_ids):,}", flush=True)
+    movie_ids = [
+        m_id
+        for idx, m_id in enumerate(all_movie_ids)
+        if idx % SHARD_TOTAL == SHARD_INDEX
+    ]
+    print(
+        f"[*] Total non-adult movies: {len(all_movie_ids):,} | Assigned to Shard {SHARD_INDEX}/{SHARD_TOTAL}: {len(movie_ids):,}",
+        flush=True,
+    )
     return movie_ids
 
 
@@ -232,14 +278,19 @@ async def run_full_scraper():
                 elapsed = max(1, time.time() - start_time)
                 speed = processed / elapsed
                 pct = (processed / total) * 100
-                print(f"[Shard {SHARD_INDEX}/{SHARD_TOTAL}] Saved: {success_count:,} | Progress: {processed:,}/{total:,} ({pct:4.1f}%) | {speed:4.1f} req/s", flush=True)
+                print(
+                    f"[Shard {SHARD_INDEX}/{SHARD_TOTAL}] Saved: {success_count:,} | Progress: {processed:,}/{total:,} ({pct:4.1f}%) | {speed:4.1f} req/s",
+                    flush=True,
+                )
 
         await asyncio.gather(*(worker(m_id) for m_id in movie_ids))
         await queue.put(None)
         await writer_task
 
     conn = duckdb.connect(DB_FILE)
-    conn.execute(f"COPY movies TO '{CSV_FILE}' (HEADER, DELIMITER ',', COMPRESSION 'gzip');")
+    conn.execute(
+        f"COPY movies TO '{CSV_FILE}' (HEADER, DELIMITER ',', COMPRESSION 'gzip');"
+    )
     conn.close()
     if os.path.exists(DB_FILE):
         os.remove(DB_FILE)
@@ -254,7 +305,10 @@ async def get_changed_movie_ids(session, start_date, end_date):
     total_pages = 1
     changed_ids = set()
 
-    print(f"[*] Fetching TMDb movie changes from {start_date} to {end_date}...", flush=True)
+    print(
+        f"[*] Fetching TMDb movie changes from {start_date} to {end_date}...",
+        flush=True,
+    )
     while page <= total_pages:
         url = f"https://api.themoviedb.org/3/movie/changes?start_date={start_date}&end_date={end_date}&page={page}"
         async with session.get(url, headers=HEADERS) as resp:
@@ -307,7 +361,10 @@ async def run_incremental(since_date):
             if processed % 50 == 0 or processed == total:
                 elapsed = max(1, time.time() - start_time)
                 speed = processed / elapsed
-                print(f"[Incremental] Saved: {success_count:,} | Progress: {processed:,}/{total:,} | {speed:4.1f} req/s", flush=True)
+                print(
+                    f"[Incremental] Saved: {success_count:,} | Progress: {processed:,}/{total:,} | {speed:4.1f} req/s",
+                    flush=True,
+                )
 
         await asyncio.gather(*(worker(m_id) for m_id in movie_ids))
         await queue.put(None)
@@ -317,10 +374,18 @@ async def run_incremental(since_date):
     conn = duckdb.connect()
     conn.execute(
         """
-        CREATE TABLE master_movies AS SELECT * FROM 'movies_master.csv.gz';
+        CREATE TABLE master_movies AS
+        SELECT
+            tmdb_id, imdb_id, backdrop_path, poster_path, year, runtime,
+            title, original_title, status, genres, description, casts,
+            casts_id, casts_image_path, crews, crews_id, crews_image_path,
+            prod_studio, prod_studio_id, prod_studio_image_path
+        FROM 'movies_master.csv.gz';
+
         ATTACH 'movies_delta.duckdb' AS delta_db;
         DELETE FROM master_movies WHERE tmdb_id IN (SELECT tmdb_id FROM delta_db.movies);
         INSERT INTO master_movies SELECT * FROM delta_db.movies;
+
         COPY master_movies TO 'movies_master.csv.gz' (HEADER, DELIMITER ',', COMPRESSION 'gzip');
     """
     )
@@ -348,7 +413,10 @@ def run_merge(input_pattern="movie_shards/movies_shard_*.csv.gz"):
     query = f"""
         COPY (
             SELECT
-                m.*,
+                m.tmdb_id, m.imdb_id, m.backdrop_path, m.poster_path, m.year, m.runtime,
+                m.title, m.original_title, m.status, m.genres, m.description, m.casts,
+                m.casts_id, m.casts_image_path, m.crews, m.crews_id, m.crews_image_path,
+                m.prod_studio, m.prod_studio_id, m.prod_studio_image_path,
                 r.averageRating AS imdb_rating,
                 r.numVotes AS imdb_votes
             FROM read_csv_auto('{input_pattern}') m
@@ -363,10 +431,19 @@ def run_merge(input_pattern="movie_shards/movies_shard_*.csv.gz"):
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "merge":
-        pattern = sys.argv[2] if len(sys.argv) > 2 else "movie_shards/movies_shard_*.csv.gz"
+        pattern = (
+            sys.argv[2] if len(sys.argv) > 2 else "movie_shards/movies_shard_*.csv.gz"
+        )
         run_merge(pattern)
     elif len(sys.argv) > 1 and sys.argv[1] == "incremental":
-        since = sys.argv[2] if len(sys.argv) > 2 else (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+        since = (
+            sys.argv[2]
+            if len(sys.argv) > 2
+            else (
+                datetime.datetime.now(datetime.timezone.utc)
+                - datetime.timedelta(days=2)
+            ).strftime("%Y-%m-%d")
+        )
         asyncio.run(run_incremental(since))
     else:
         asyncio.run(run_full_scraper())

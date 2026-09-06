@@ -107,8 +107,16 @@ async def fetch_show(session, semaphore, show_id, retries=5):
 
                         first_air = data.get("first_air_date") or ""
                         last_air = data.get("last_air_date") or ""
-                        start_year = int(first_air[:4]) if len(first_air) >= 4 and first_air[:4].isdigit() else None
-                        end_year = int(last_air[:4]) if len(last_air) >= 4 and last_air[:4].isdigit() else None
+                        start_year = (
+                            int(first_air[:4])
+                            if len(first_air) >= 4 and first_air[:4].isdigit()
+                            else None
+                        )
+                        end_year = (
+                            int(last_air[:4])
+                            if len(last_air) >= 4 and last_air[:4].isdigit()
+                            else None
+                        )
 
                         show_record = (
                             data.get("id"),
@@ -120,30 +128,70 @@ async def fetch_show(session, semaphore, show_id, retries=5):
                             start_year,
                             end_year,
                             data.get("status"),
-                            orjson.dumps([g.get("name") for g in data.get("genres", []) if g.get("name")]).decode("utf-8"),
+                            orjson.dumps(
+                                [
+                                    g.get("name")
+                                    for g in data.get("genres", [])
+                                    if g.get("name")
+                                ]
+                            ).decode("utf-8"),
                             data.get("overview"),
-                            orjson.dumps([c.get("name") for c in created_by]).decode("utf-8"),
-                            orjson.dumps([c.get("id") for c in created_by]).decode("utf-8"),
-                            orjson.dumps([c.get("profile_path") for c in created_by]).decode("utf-8"),
-                            orjson.dumps([c.get("name") for c in cast_list]).decode("utf-8"),
-                            orjson.dumps([c.get("id") for c in cast_list]).decode("utf-8"),
-                            orjson.dumps([c.get("profile_path") for c in cast_list]).decode("utf-8"),
-                            orjson.dumps([c.get("name") for c in crew_list]).decode("utf-8"),
-                            orjson.dumps([c.get("id") for c in crew_list]).decode("utf-8"),
-                            orjson.dumps([c.get("profile_path") for c in crew_list]).decode("utf-8"),
-                            orjson.dumps([n.get("name") for n in networks]).decode("utf-8"),
-                            orjson.dumps([n.get("id") for n in networks]).decode("utf-8"),
-                            orjson.dumps([n.get("logo_path") for n in networks]).decode("utf-8"),
-                            orjson.dumps([p.get("name") for p in prod_list]).decode("utf-8"),
-                            orjson.dumps([p.get("id") for p in prod_list]).decode("utf-8"),
-                            orjson.dumps([p.get("logo_path") for p in prod_list]).decode("utf-8"),
+                            orjson.dumps([c.get("name") for c in created_by]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([c.get("id") for c in created_by]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps(
+                                [c.get("profile_path") for c in created_by]
+                            ).decode("utf-8"),
+                            orjson.dumps([c.get("name") for c in cast_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([c.get("id") for c in cast_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps(
+                                [c.get("profile_path") for c in cast_list]
+                            ).decode("utf-8"),
+                            orjson.dumps([c.get("name") for c in crew_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([c.get("id") for c in crew_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps(
+                                [c.get("profile_path") for c in crew_list]
+                            ).decode("utf-8"),
+                            orjson.dumps([n.get("name") for n in networks]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([n.get("id") for n in networks]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([n.get("logo_path") for n in networks]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([p.get("name") for p in prod_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([p.get("id") for p in prod_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps(
+                                [p.get("logo_path") for p in prod_list]
+                            ).decode("utf-8"),
                             data.get("number_of_seasons"),
                         )
 
                         seasons_records = []
                         for s in data.get("seasons", []):
                             s_air = s.get("air_date") or ""
-                            s_year = int(s_air[:4]) if len(s_air) >= 4 and s_air[:4].isdigit() else None
+                            s_year = (
+                                int(s_air[:4])
+                                if len(s_air) >= 4 and s_air[:4].isdigit()
+                                else None
+                            )
                             seasons_records.append(
                                 (
                                     data.get("id"),
@@ -156,7 +204,13 @@ async def fetch_show(session, semaphore, show_id, retries=5):
                                 )
                             )
 
-                        return "OK", show_record, seasons_records, data.get("name"), start_year
+                        return (
+                            "OK",
+                            show_record,
+                            seasons_records,
+                            data.get("name"),
+                            start_year,
+                        )
 
                     elif resp.status == 404:
                         return "404", None, [], None, None
@@ -166,10 +220,16 @@ async def fetch_show(session, semaphore, show_id, retries=5):
                         async with pause_lock:
                             if pause_event.is_set():
                                 pause_event.clear()
-                                print(f"\n[429] Rate limit hit. Pausing for {retry_after:.1f}s:", flush=True)
+                                print(
+                                    f"\n[429] Rate limit hit. Pausing for {retry_after:.1f}s:",
+                                    flush=True,
+                                )
                                 remaining = retry_after
                                 while remaining > 0:
-                                    print(f"  [429] {remaining:.1f}s remaining...", flush=True)
+                                    print(
+                                        f"  [429] {remaining:.1f}s remaining...",
+                                        flush=True,
+                                    )
                                     step = min(1.0, remaining)
                                     await asyncio.sleep(step)
                                     remaining -= step
@@ -202,16 +262,27 @@ async def writer_worker(queue, db_path=DB_FILE):
         seasons_batch.extend(seasons_recs)
 
         if len(shows_batch) >= 200:
-            conn.executemany("INSERT OR REPLACE INTO shows VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", shows_batch)
+            conn.executemany(
+                "INSERT OR REPLACE INTO shows VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                shows_batch,
+            )
             if seasons_batch:
-                conn.executemany("INSERT OR REPLACE INTO seasons VALUES (?,?,?,?,?,?,?)", seasons_batch)
+                conn.executemany(
+                    "INSERT OR REPLACE INTO seasons VALUES (?,?,?,?,?,?,?)",
+                    seasons_batch,
+                )
             shows_batch.clear()
             seasons_batch.clear()
 
     if shows_batch:
-        conn.executemany("INSERT OR REPLACE INTO shows VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", shows_batch)
+        conn.executemany(
+            "INSERT OR REPLACE INTO shows VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            shows_batch,
+        )
     if seasons_batch:
-        conn.executemany("INSERT OR REPLACE INTO seasons VALUES (?,?,?,?,?,?,?)", seasons_batch)
+        conn.executemany(
+            "INSERT OR REPLACE INTO seasons VALUES (?,?,?,?,?,?,?)", seasons_batch
+        )
     conn.close()
 
 
@@ -235,7 +306,10 @@ async def download_tmdb_tv_dump(session):
             if resp.status == 200:
                 with open(dump_filename, "wb") as f:
                     f.write(await resp.read())
-                print(f"[+] [Shard {SHARD_INDEX}] Downloaded TV dump for {date_str}", flush=True)
+                print(
+                    f"[+] [Shard {SHARD_INDEX}] Downloaded TV dump for {date_str}",
+                    flush=True,
+                )
                 downloaded = True
                 break
 
@@ -249,8 +323,13 @@ async def download_tmdb_tv_dump(session):
     if os.path.exists(dump_filename):
         os.remove(dump_filename)
 
-    tv_ids = [t_id for idx, t_id in enumerate(all_tv_ids) if idx % SHARD_TOTAL == SHARD_INDEX]
-    print(f"[*] Total shows: {len(all_tv_ids):,} | Assigned to Shard {SHARD_INDEX}/{SHARD_TOTAL}: {len(tv_ids):,}", flush=True)
+    tv_ids = [
+        t_id for idx, t_id in enumerate(all_tv_ids) if idx % SHARD_TOTAL == SHARD_INDEX
+    ]
+    print(
+        f"[*] Total shows: {len(all_tv_ids):,} | Assigned to Shard {SHARD_INDEX}/{SHARD_TOTAL}: {len(tv_ids):,}",
+        flush=True,
+    )
     return tv_ids
 
 
@@ -273,7 +352,9 @@ async def run_full_scraper():
 
         async def worker(t_id):
             nonlocal processed, success_count
-            status, show_rec, seasons_recs, title, year = await fetch_show(session, semaphore, t_id)
+            status, show_rec, seasons_recs, title, year = await fetch_show(
+                session, semaphore, t_id
+            )
             if status == "OK":
                 success_count += 1
                 await queue.put((show_rec, seasons_recs))
@@ -283,15 +364,22 @@ async def run_full_scraper():
                 elapsed = max(1, time.time() - start_time)
                 speed = processed / elapsed
                 pct = (processed / total) * 100
-                print(f"[Shard {SHARD_INDEX}/{SHARD_TOTAL}] Saved: {success_count:,} | Progress: {processed:,}/{total:,} ({pct:4.1f}%) | {speed:4.1f} req/s", flush=True)
+                print(
+                    f"[Shard {SHARD_INDEX}/{SHARD_TOTAL}] Saved: {success_count:,} | Progress: {processed:,}/{total:,} ({pct:4.1f}%) | {speed:4.1f} req/s",
+                    flush=True,
+                )
 
         await asyncio.gather(*(worker(t_id) for t_id in tv_ids))
         await queue.put(None)
         await writer_task
 
     conn = duckdb.connect(DB_FILE)
-    conn.execute(f"COPY shows TO '{SHOWS_CSV}' (HEADER, DELIMITER ',', COMPRESSION 'gzip');")
-    conn.execute(f"COPY seasons TO '{SEASONS_CSV}' (HEADER, DELIMITER ',', COMPRESSION 'gzip');")
+    conn.execute(
+        f"COPY shows TO '{SHOWS_CSV}' (HEADER, DELIMITER ',', COMPRESSION 'gzip');"
+    )
+    conn.execute(
+        f"COPY seasons TO '{SEASONS_CSV}' (HEADER, DELIMITER ',', COMPRESSION 'gzip');"
+    )
     conn.close()
     if os.path.exists(DB_FILE):
         os.remove(DB_FILE)
@@ -306,7 +394,9 @@ async def get_changed_tv_ids(session, start_date, end_date):
     total_pages = 1
     changed_ids = set()
 
-    print(f"[*] Fetching TMDb TV changes from {start_date} to {end_date}...", flush=True)
+    print(
+        f"[*] Fetching TMDb TV changes from {start_date} to {end_date}...", flush=True
+    )
     while page <= total_pages:
         url = f"https://api.themoviedb.org/3/tv/changes?start_date={start_date}&end_date={end_date}&page={page}"
         async with session.get(url, headers=HEADERS) as resp:
@@ -351,7 +441,9 @@ async def run_incremental(since_date):
 
         async def worker(t_id):
             nonlocal processed, success_count
-            status, show_rec, seasons_recs, title, year = await fetch_show(session, semaphore, t_id)
+            status, show_rec, seasons_recs, title, year = await fetch_show(
+                session, semaphore, t_id
+            )
             if status == "OK":
                 success_count += 1
                 await queue.put((show_rec, seasons_recs))
@@ -359,7 +451,10 @@ async def run_incremental(since_date):
             if processed % 50 == 0 or processed == total:
                 elapsed = max(1, time.time() - start_time)
                 speed = processed / elapsed
-                print(f"[Incremental] Saved: {success_count:,} | Progress: {processed:,}/{total:,} | {speed:4.1f} req/s", flush=True)
+                print(
+                    f"[Incremental] Saved: {success_count:,} | Progress: {processed:,}/{total:,} | {speed:4.1f} req/s",
+                    flush=True,
+                )
 
         await asyncio.gather(*(worker(t_id) for t_id in tv_ids))
         await queue.put(None)
@@ -369,8 +464,20 @@ async def run_incremental(since_date):
     conn = duckdb.connect()
     conn.execute(
         """
-        CREATE TABLE master_shows AS SELECT * FROM 'shows_master.csv.gz';
-        CREATE TABLE master_seasons AS SELECT * FROM 'seasons_master.csv.gz';
+        CREATE TABLE master_shows AS
+        SELECT
+            tmdb_id, imdb_id, title, original_title, backdrop_path, poster_path,
+            start_year, end_year, status, genres, description, showrunner_and_creator,
+            showrunner_and_creator_id, showrunner_and_creator_image, casts, casts_id,
+            casts_image, crews, crews_id, crews_image, original_network, original_network_id,
+            original_network_image, prod_studio, prod_studio_id, prod_studio_image, total_seasons
+        FROM 'shows_master.csv.gz';
+
+        CREATE TABLE master_seasons AS
+        SELECT
+            show_tmdb_id, show_imdb_id, season_number, season_name, air_year, poster_path, tmdb_episode_count
+        FROM 'seasons_master.csv.gz';
+
         ATTACH 'shows_delta.duckdb' AS delta_db;
 
         DELETE FROM master_shows WHERE tmdb_id IN (SELECT tmdb_id FROM delta_db.shows);
@@ -392,7 +499,10 @@ async def run_incremental(since_date):
 # ==========================================
 # 3. MERGE & REFRESH IMDB RATINGS (SEASON 0 INCLUDED)
 # ==========================================
-def run_merge(shows_pattern="show_shards/shows_shard_*.csv.gz", seasons_pattern="show_shards/seasons_shard_*.csv.gz"):
+def run_merge(
+    shows_pattern="show_shards/shows_shard_*.csv.gz",
+    seasons_pattern="show_shards/seasons_shard_*.csv.gz",
+):
     files = {
         "title.ratings.tsv.gz": "https://datasets.imdbws.com/title.ratings.tsv.gz",
         "title.episode.tsv.gz": "https://datasets.imdbws.com/title.episode.tsv.gz",
@@ -417,7 +527,6 @@ def run_merge(shows_pattern="show_shards/shows_shard_*.csv.gz", seasons_pattern=
         LEFT JOIN read_csv('title.basics.tsv.gz', delim='\\t', nullstr='\\\\N') b ON e.tconst = b.tconst
         GROUP BY e.parentTconst;
 
-        -- COALESCE maps IMDb null/blank specials to TMDb Season 0
         CREATE OR REPLACE VIEW season_ratings AS
         SELECT
             e.parentTconst,
@@ -431,7 +540,11 @@ def run_merge(shows_pattern="show_shards/shows_shard_*.csv.gz", seasons_pattern=
 
         COPY (
             SELECT
-                s.*,
+                s.tmdb_id, s.imdb_id, s.title, s.original_title, s.backdrop_path, s.poster_path,
+                s.start_year, s.end_year, s.status, s.genres, s.description, s.showrunner_and_creator,
+                s.showrunner_and_creator_id, s.showrunner_and_creator_image, s.casts, s.casts_id,
+                s.casts_image, s.crews, s.crews_id, s.crews_image, s.original_network, s.original_network_id,
+                s.original_network_image, s.prod_studio, s.prod_studio_id, s.prod_studio_image, s.total_seasons,
                 r.averageRating AS imdb_rating,
                 r.numVotes AS imdb_votes,
                 ep.total_episodes AS imdb_total_episodes,
@@ -443,7 +556,7 @@ def run_merge(shows_pattern="show_shards/shows_shard_*.csv.gz", seasons_pattern=
 
         COPY (
             SELECT
-                sn.*,
+                sn.show_tmdb_id, sn.show_imdb_id, sn.season_number, sn.season_name, sn.air_year, sn.poster_path, sn.tmdb_episode_count,
                 sr.season_imdb_rating,
                 sr.season_imdb_votes,
                 sr.season_imdb_episodes
@@ -459,10 +572,19 @@ def run_merge(shows_pattern="show_shards/shows_shard_*.csv.gz", seasons_pattern=
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "merge":
         s_pat = sys.argv[2] if len(sys.argv) > 2 else "show_shards/shows_shard_*.csv.gz"
-        sn_pat = sys.argv[3] if len(sys.argv) > 3 else "show_shards/seasons_shard_*.csv.gz"
+        sn_pat = (
+            sys.argv[3] if len(sys.argv) > 3 else "show_shards/seasons_shard_*.csv.gz"
+        )
         run_merge(s_pat, sn_pat)
     elif len(sys.argv) > 1 and sys.argv[1] == "incremental":
-        since = sys.argv[2] if len(sys.argv) > 2 else (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+        since = (
+            sys.argv[2]
+            if len(sys.argv) > 2
+            else (
+                datetime.datetime.now(datetime.timezone.utc)
+                - datetime.timedelta(days=2)
+            ).strftime("%Y-%m-%d")
+        )
         asyncio.run(run_incremental(since))
     else:
         asyncio.run(run_full_scraper())

@@ -2,6 +2,7 @@ import csv
 import datetime
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -18,6 +19,27 @@ DB_PATH = "anime.db"
 csv.field_size_limit(2147483647)
 ANILIST_API = "https://graphql.anilist.co"
 
+EXCLUDED_FORMATS = {"MUSIC"}
+IGNORED_RELATIONS = {"ALTERNATIVE", "OTHER", "CHARACTER"}
+EXCLUDED_ROLES = {
+    "adr",
+    "voice",
+    "sound",
+    "art",
+    "animation",
+    "casting",
+    "technical",
+    "cgi",
+    "3d",
+    "action",
+    "assistant",
+    "photography",
+    "episode",
+    "unit",
+    "deputy",
+    "sub",
+}
+
 ANILIST_QUERY = """
 query ($page: Int, $perPage: Int, $startDate: FuzzyDateInt, $endDate: FuzzyDateInt, $status: MediaStatus) {
   Page(page: $page, perPage: $perPage) {
@@ -28,7 +50,8 @@ query ($page: Int, $perPage: Int, $startDate: FuzzyDateInt, $endDate: FuzzyDateI
     }
     media(type: ANIME, startDate_greater: $startDate, startDate_lesser: $endDate, status: $status) {
       id
-      title { romaji english native }
+      idMal
+      title { romaji english native userPreferred }
       format
       status
       description
@@ -36,12 +59,24 @@ query ($page: Int, $perPage: Int, $startDate: FuzzyDateInt, $endDate: FuzzyDateI
       episodes
       bannerImage
       coverImage { extraLarge large }
+      genres
       averageScore
-      studios(isMain: true) { edges { node { name } } }
+      popularity
+      isAdult
+      studios(isMain: true) { edges { isMain node { name isAnimationStudio } } }
+      staff(sort: [RELEVANCE], perPage: 25) {
+        edges {
+          role
+          node {
+            name { full userPreferred }
+            image { large medium }
+          }
+        }
+      }
       relations {
         edges {
           relationType
-          node { id type }
+          node { id type format }
         }
       }
       recommendations(sort: [RATING_DESC], perPage: 15) {
@@ -71,182 +106,78 @@ def download_prerequisites():
         )
 
 
-def fetch_all_from_anilist_api():
-    print("[*] Querying AniList GraphQL API using year-based chunking...", flush=True)
+def extract_director_and_image(raw_staff_edges):
+    if not raw_staff_edges:
+        return None, None
+    directors = []
+    director_image = None
+    for edge in raw_staff_edges:
+        raw_role = (edge.get("role") or "").strip().lower()
+        if any(kw in raw_role for kw in EXCLUDED_ROLES):
+            continue
+        if raw_role in (
+            "director",
+            "series director",
+            "chief director",
+            "総監督",
+            "監督",
+        ):
+            node = edge.get("node", {})
+            name_obj = node.get("name", {})
+            name = name_obj.get("userPreferred") or name_obj.get("full")
+            if name and name not in directors:
+                directors.append(name)
+                if not director_image:
+                    img_obj = node.get("image", {})
+                    if isinstance(img_obj, dict):
+                        director_image = img_obj.get("large") or img_obj.get("medium")
+    return (", ".join(directors) if directors else None), director_image
 
-    year_ranges = [
-        (1940, 1965),
-        (1966, 1970),
-        (1971, 1975),
-        (1976, 1980),
-        (1981, 1985),
-        (1986, 1990),
-        (1991, 1995),
-        (1996, 2000),
-        (2001, 2005),
-        (2006, 2007),
-        (2008, 2009),
-        (2010, 2011),
-        (2012, 2013),
-        (2014, 2015),
-    ]
-    target_year = datetime.datetime.now(datetime.timezone.utc).year + 1
-    year_ranges.extend([(y, y) for y in range(2016, target_year + 1)])
 
-    media_store = {}
-    raw_recs_map = {}
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-
-    def process_media_list(media_list):
-        for m in media_list:
-            a_id = m["id"]
-            fmt = m.get("format") or "TV"
-            if fmt == "MUSIC":
-                continue
-
-            relations = m.get("relations", {}).get("edges", [])
-            recs_list = m.get("recommendations", {}).get("edges", [])
-
-            parsed_recs = []
-            for item in recs_list:
-                node = item.get("node") or {}
-                rating = node.get("rating") or 0
-                rec_target = node.get("mediaRecommendation") or {}
-                if rating > 0 and rec_target.get("id"):
-                    parsed_recs.append((rating, int(rec_target["id"])))
-            parsed_recs.sort(key=lambda x: x[0], reverse=True)
-            raw_recs_map[a_id] = [r_id for _, r_id in parsed_recs]
-
-            studio_name = None
-            studios_edges = m.get("studios", {}).get("edges", [])
-            if studios_edges:
-                studio_name = studios_edges[0].get("node", {}).get("name")
-
-            s_date = m.get("startDate") or {}
-            y, mo, d = s_date.get("year"), s_date.get("month"), s_date.get("day")
-            start_date = (
-                f"{int(y):04d}-{int(mo) if mo else 1:02d}-{int(d) if d else 1:02d}"
-                if y
-                else None
-            )
-
-            score_val = m.get("averageScore")
-            rating = round(float(score_val) / 10.0, 1) if score_val else None
-
-            title_obj = m.get("title") or {}
-            cover_obj = m.get("coverImage") or {}
-
-            media_store[a_id] = {
-                "id": a_id,
-                "title_english": title_obj.get("english"),
-                "title_romaji": title_obj.get("romaji") or "Unknown",
-                "format": fmt,
-                "episodes": m.get("episodes"),
-                "status": m.get("status"),
-                "rating": rating,
-                "banner_url": m.get("bannerImage"),
-                "cover_url": cover_obj.get("extraLarge") or cover_obj.get("large"),
-                "studio": studio_name,
-                "start_date": start_date,
-                "relations": relations,
-            }
-
-    # 1. Fetch Year Chunks
-    for start_year, end_year in year_ranges:
-        start_date = convert_to_fuzzy_date(start_year - 1, 12, 31)
-        end_date = convert_to_fuzzy_date(end_year + 1, 1, 1)
-        page = 1
-        has_next_page = True
-
-        while has_next_page:
-            variables = {
-                "page": page,
-                "perPage": 50,
-                "startDate": start_date,
-                "endDate": end_date,
-            }
-            payload = {"query": ANILIST_QUERY, "variables": variables}
-            resp = None
-
-            for attempt in range(5):
-                try:
-                    r = requests.post(
-                        ANILIST_API, json=payload, headers=headers, timeout=30
-                    )
-                    if r.status_code == 200:
-                        resp = r.json()
-                        break
-                    elif r.status_code == 429:
-                        retry_after = int(r.headers.get("Retry-After", 60))
-                        print(
-                            f"  [429] AniList rate limit. Sleeping {retry_after}s...",
-                            flush=True,
-                        )
-                        time.sleep(retry_after)
-                    else:
-                        time.sleep(2)
-                except Exception:
-                    time.sleep(2)
-
-            if not resp or "data" not in resp:
-                break
-
-            page_data = resp["data"]["Page"]
-            process_media_list(page_data.get("media", []))
-
-            page_info = page_data.get("pageInfo", {})
-            has_next_page = page_info.get("hasNextPage", False)
-            page += 1
-            time.sleep(0.6)
-
-        print(
-            f"[*] Fetched {start_year}-{end_year} | Total unique so far: {len(media_store):,}",
-            flush=True,
-        )
-
-    # 2. Fetch TBA / Date-less Anime Pass
-    print(
-        "[*] Fetching TBA and date-less anime (status: NOT_YET_RELEASED)...", flush=True
-    )
-    page = 1
-    has_next_page = True
-    while has_next_page:
-        variables = {"page": page, "perPage": 50, "status": "NOT_YET_RELEASED"}
-        payload = {"query": ANILIST_QUERY, "variables": variables}
-        resp = None
-
-        for attempt in range(5):
-            try:
-                r = requests.post(
-                    ANILIST_API, json=payload, headers=headers, timeout=30
-                )
-                if r.status_code == 200:
-                    resp = r.json()
-                    break
-                elif r.status_code == 429:
-                    retry_after = int(r.headers.get("Retry-After", 60))
-                    time.sleep(retry_after)
-                else:
-                    time.sleep(2)
-            except Exception:
-                time.sleep(2)
-
-        if not resp or "data" not in resp:
+def extract_studio(raw_studios_edges):
+    if not raw_studios_edges:
+        return None
+    main_studio = None
+    first_studio = None
+    for edge in raw_studios_edges:
+        node = edge.get("node", {})
+        name = node.get("name")
+        if not name:
+            continue
+        if not first_studio:
+            first_studio = name
+        if edge.get("isMain") is True or node.get("isAnimationStudio") is True:
+            main_studio = name
             break
+    return main_studio if main_studio else first_studio
 
-        page_data = resp["data"]["Page"]
-        process_media_list(page_data.get("media", []))
 
-        page_info = page_data.get("pageInfo", {})
-        has_next_page = page_info.get("hasNextPage", False)
-        page += 1
-        time.sleep(0.6)
+def clean_genres_to_string(raw_genres):
+    if not raw_genres:
+        return ""
+    if isinstance(raw_genres, list):
+        return ", ".join(sorted([str(g).strip() for g in raw_genres if str(g).strip()]))
+    cleaned = str(raw_genres).strip("[]\"'")
+    parts = [p.strip() for p in re.split(r",\s*", cleaned) if p.strip()]
+    return ", ".join(sorted(set(parts)))
 
-    print(
-        f"[+] Complete AniList dataset retrieved: {len(media_store):,} total anime.",
-        flush=True,
+
+def is_recap_or_summary(title):
+    if not title:
+        return False
+    lower = title.lower()
+    return any(
+        k in lower
+        for k in [
+            "recap",
+            "summary",
+            "soushuuhen",
+            "compilation",
+            "chronicle",
+            "総集編",
+            "特別編集版",
+        ]
     )
-    return media_store, raw_recs_map
 
 
 def clean_sub_title(full_title, root_title, format_str=""):
@@ -276,6 +207,184 @@ def extract_part_label(title):
     return None
 
 
+def fetch_all_from_anilist_api():
+    print("[*] Querying AniList GraphQL API (5,000 pagination bypass)...", flush=True)
+    year_ranges = [
+        (1940, 1965),
+        (1966, 1970),
+        (1971, 1975),
+        (1976, 1980),
+        (1981, 1985),
+        (1986, 1990),
+        (1991, 1995),
+        (1996, 2000),
+        (2001, 2005),
+        (2006, 2007),
+        (2008, 2009),
+        (2010, 2011),
+        (2012, 2013),
+        (2014, 2015),
+    ]
+    target_year = datetime.datetime.now(datetime.timezone.utc).year + 1
+    year_ranges.extend([(y, y) for y in range(2016, target_year + 1)])
+
+    media_store = {}
+    raw_recs_map = {}
+    summary_ids = set()
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+
+    def process_media_list(media_list):
+        for m in media_list:
+            a_id = m["id"]
+            fmt = (m.get("format") or "TV").upper()
+            if fmt in EXCLUDED_FORMATS:
+                continue
+
+            title_obj = m.get("title") or {}
+            romaji = (title_obj.get("romaji") or "").strip()
+            english = (title_obj.get("english") or "").strip()
+            title = english if english else romaji
+
+            if is_recap_or_summary(title) or is_recap_or_summary(romaji):
+                summary_ids.add(a_id)
+
+            relations = m.get("relations", {}).get("edges", [])
+            for r in relations:
+                if r.get("relationType") in ("SUMMARY", "COMPILATION"):
+                    t_id = r.get("node", {}).get("id")
+                    if t_id:
+                        summary_ids.add(int(t_id))
+
+            recs_list = m.get("recommendations", {}).get("edges", [])
+            parsed_recs = []
+            for item in recs_list:
+                node = item.get("node") or {}
+                rating = node.get("rating") or 0
+                rec_target = node.get("mediaRecommendation") or {}
+                if rating > 0 and rec_target.get("id"):
+                    parsed_recs.append((rating, int(rec_target["id"])))
+            parsed_recs.sort(key=lambda x: x[0], reverse=True)
+            raw_recs_map[a_id] = [r_id for _, r_id in parsed_recs]
+
+            studio = extract_studio(m.get("studios", {}).get("edges", []))
+            director, director_image = extract_director_and_image(
+                m.get("staff", {}).get("edges", [])
+            )
+
+            s_date = m.get("startDate") or {}
+            y, mo, d = s_date.get("year"), s_date.get("month"), s_date.get("day")
+            start_date = (
+                f"{int(y):04d}-{int(mo) if mo else 1:02d}-{int(d) if d else 1:02d}"
+                if y
+                else None
+            )
+
+            score_val = m.get("averageScore")
+            rating = round(float(score_val) / 10.0, 1) if score_val else None
+            cover_obj = m.get("coverImage") or {}
+
+            media_store[a_id] = {
+                "id": a_id,
+                "title_english": english if english else None,
+                "title_romaji": romaji if romaji else "Unknown",
+                "format": fmt,
+                "episodes": m.get("episodes"),
+                "status": m.get("status"),
+                "rating": rating,
+                "popularity": m.get("popularity") or 0,
+                "genres": clean_genres_to_string(m.get("genres")),
+                "is_adult": 1 if m.get("isAdult") else 0,
+                "description": m.get("description"),
+                "banner_url": m.get("bannerImage"),
+                "cover_url": cover_obj.get("extraLarge") or cover_obj.get("large"),
+                "studio": studio,
+                "director": director,
+                "director_image": director_image,
+                "start_date": start_date,
+                "relations": relations,
+            }
+
+    for start_year, end_year in year_ranges:
+        start_date = convert_to_fuzzy_date(start_year - 1, 12, 31)
+        end_date = convert_to_fuzzy_date(end_year + 1, 1, 1)
+        page = 1
+        has_next_page = True
+
+        while has_next_page:
+            variables = {
+                "page": page,
+                "perPage": 50,
+                "startDate": start_date,
+                "endDate": end_date,
+            }
+            payload = {"query": ANILIST_QUERY, "variables": variables}
+            resp = None
+
+            for attempt in range(5):
+                try:
+                    r = requests.post(
+                        ANILIST_API, json=payload, headers=headers, timeout=30
+                    )
+                    if r.status_code == 200:
+                        resp = r.json()
+                        break
+                    elif r.status_code == 429:
+                        retry_after = int(r.headers.get("Retry-After", 60))
+                        time.sleep(retry_after)
+                    else:
+                        time.sleep(2)
+                except Exception:
+                    time.sleep(2)
+
+            if not resp or "data" not in resp:
+                break
+
+            page_data = resp["data"]["Page"]
+            process_media_list(page_data.get("media", []))
+            page_info = page_data.get("pageInfo", {})
+            has_next_page = page_info.get("hasNextPage", False)
+            page += 1
+            time.sleep(0.6)
+
+        print(
+            f"[*] Fetched {start_year}-{end_year} | Total: {len(media_store):,}",
+            flush=True,
+        )
+
+    # TBA Pass
+    page = 1
+    has_next_page = True
+    while has_next_page:
+        variables = {"page": page, "perPage": 50, "status": "NOT_YET_RELEASED"}
+        payload = {"query": ANILIST_QUERY, "variables": variables}
+        resp = None
+        for attempt in range(5):
+            try:
+                r = requests.post(
+                    ANILIST_API, json=payload, headers=headers, timeout=30
+                )
+                if r.status_code == 200:
+                    resp = r.json()
+                    break
+                elif r.status_code == 429:
+                    time.sleep(int(r.headers.get("Retry-After", 60)))
+                else:
+                    time.sleep(2)
+            except Exception:
+                time.sleep(2)
+
+        if not resp or "data" not in resp:
+            break
+
+        page_data = resp["data"]["Page"]
+        process_media_list(page_data.get("media", []))
+        has_next_page = page_data.get("pageInfo", {}).get("hasNextPage", False)
+        page += 1
+        time.sleep(0.6)
+
+    return media_store, raw_recs_map, summary_ids
+
+
 def run_anime_pipeline():
     download_prerequisites()
 
@@ -283,6 +392,8 @@ def run_anime_pipeline():
         print(f"[*] Reading existing AniList dataset from {CSV_PATH}...", flush=True)
         media_store = {}
         raw_recs_map = {}
+        summary_ids = set()
+
         with open(CSV_PATH, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -291,8 +402,8 @@ def run_anime_pipeline():
                 except Exception:
                     continue
 
-                fmt = row.get("format") or "TV"
-                if fmt == "MUSIC":
+                fmt = (row.get("format") or "TV").upper()
+                if fmt in EXCLUDED_FORMATS:
                     continue
 
                 try:
@@ -315,13 +426,10 @@ def run_anime_pipeline():
                 except Exception:
                     raw_recs_map[a_id] = []
 
-                studio_name = None
-                try:
-                    studios_list = json.loads(row.get("studios") or "[]")
-                    if studios_list:
-                        studio_name = studios_list[0].get("name")
-                except Exception:
-                    pass
+                studio = extract_studio(json.loads(row.get("studios") or "[]"))
+                director, director_image = extract_director_and_image(
+                    json.loads(row.get("staff") or "[]")
+                )
 
                 y = row.get("startDate_year")
                 m = row.get("startDate_month")
@@ -338,9 +446,13 @@ def run_anime_pipeline():
                     if score_val and score_val != "nan"
                     else None
                 )
-
                 ep_val = row.get("episodes")
                 episodes = int(float(ep_val)) if ep_val and ep_val != "nan" else None
+                pop_val = row.get("popularity")
+                popularity = int(float(pop_val)) if pop_val and pop_val != "nan" else 0
+
+                is_adult_str = str(row.get("isAdult") or "").strip().lower()
+                is_adult = 1 if is_adult_str in ("true", "1") else 0
 
                 media_store[a_id] = {
                     "id": a_id,
@@ -352,17 +464,23 @@ def run_anime_pipeline():
                     "episodes": episodes,
                     "status": row.get("status"),
                     "rating": rating,
+                    "popularity": popularity,
+                    "genres": clean_genres_to_string(row.get("genres")),
+                    "is_adult": is_adult,
+                    "description": row.get("description"),
                     "banner_url": row.get("bannerImage")
                     if row.get("bannerImage") != "nan"
                     else None,
                     "cover_url": row.get("coverImage_extraLarge")
                     or row.get("coverImage_large"),
-                    "studio": studio_name,
+                    "studio": studio,
+                    "director": director,
+                    "director_image": director_image,
                     "start_date": start_date,
                     "relations": relations,
                 }
     else:
-        media_store, raw_recs_map = fetch_all_from_anilist_api()
+        media_store, raw_recs_map, summary_ids = fetch_all_from_anilist_api()
 
     print("[*] Loading Fribb mapping...", flush=True)
     with open(FRIBB_JSON_PATH, "r", encoding="utf-8") as f:
@@ -392,6 +510,8 @@ def run_anime_pipeline():
     print("[*] Building canon franchise graph...", flush=True)
     spine_adj = defaultdict(set)
     for m_id, m in media_store.items():
+        if m_id in summary_ids:
+            continue
         for rel in m["relations"]:
             if (rel.get("node") or {}).get("type") == "ANIME":
                 rel_type = rel.get("relationType")
@@ -399,6 +519,7 @@ def run_anime_pipeline():
                 if (
                     target_id
                     and target_id in media_store
+                    and target_id not in summary_ids
                     and rel_type in ("PREQUEL", "SEQUEL")
                 ):
                     spine_adj[m_id].add(target_id)
@@ -408,7 +529,7 @@ def run_anime_pipeline():
     timeline_records = []
 
     for m_id in media_store:
-        if m_id in visited_spines:
+        if m_id in summary_ids or m_id in visited_spines:
             continue
         spine = []
         q = deque([m_id])
@@ -449,6 +570,7 @@ def run_anime_pipeline():
                     if (
                         target_id
                         and target_id in media_store
+                        and target_id not in summary_ids
                         and target_id not in seen_in_cluster
                     ):
                         if rel_type == "SPIN_OFF":
@@ -488,6 +610,8 @@ def run_anime_pipeline():
     anime_records = []
     recommendation_records = []
     for a_id, m in media_store.items():
+        if a_id in summary_ids:
+            continue
         fb = fribb_map.get(a_id, {})
         imdb_id = fb.get("imdb_id") or f"al:{a_id}"
         anime_records.append(
@@ -504,15 +628,21 @@ def run_anime_pipeline():
                 m["episodes"],
                 m["status"],
                 m["rating"],
+                m["popularity"],
+                m["genres"],
+                m["is_adult"],
+                m["description"],
                 m["banner_url"],
                 m["cover_url"],
                 m["studio"],
+                m["director"],
+                m["director_image"],
                 m["start_date"],
             )
         )
         recs = raw_recs_map.get(a_id, [])
         for rank, rec_id in enumerate(recs[:12], start=1):
-            if rec_id in media_store:
+            if rec_id in media_store and rec_id not in summary_ids:
                 recommendation_records.append((a_id, rec_id, rank))
 
     if os.path.exists(DB_PATH):
@@ -536,9 +666,15 @@ def run_anime_pipeline():
             episodes INTEGER,
             status TEXT,
             rating REAL,
+            popularity INTEGER,
+            genres TEXT,
+            is_adult INTEGER NOT NULL,
+            description TEXT,
             banner_url TEXT,
             cover_url TEXT,
             studio TEXT,
+            director TEXT,
+            director_image TEXT,
             start_date TEXT
         );
     """)
@@ -561,7 +697,7 @@ def run_anime_pipeline():
         );
     """)
     cur.executemany(
-        "INSERT OR REPLACE INTO anime VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+        "INSERT OR REPLACE INTO anime VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
         anime_records,
     )
     cur.executemany(

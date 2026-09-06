@@ -32,6 +32,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # ====================================================
+  # PATH A: INCREMENTAL UPDATE (~3 MINS)
+  # ====================================================
   incremental-sync:
     needs: check-mode
     if: needs.check-mode.outputs.has_release == 'true'

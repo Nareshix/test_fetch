@@ -1,7 +1,9 @@
 import os
 import duckdb
 
-print("[*] Building Master SQLite Database with Deduplicated FTS5 Search...", flush=True)
+print(
+    "[*] Building Master SQLite Database with Deduplicated FTS5 Search...", flush=True
+)
 
 if os.path.exists("media.sqlite"):
     os.remove("media.sqlite")
@@ -62,7 +64,6 @@ conn.execute("""
 """)
 
 if has_anime:
-    # 1. Insert Anime FIRST (Anime gets priority for search)
     conn.execute("""
         INSERT INTO sqlite_db.search_index (title, original_title, casts, media_type, item_id, year, poster_path, rating)
         SELECT
@@ -76,13 +77,11 @@ if has_anime:
             rating
         FROM sqlite_db.anime;
 
-        -- 2. Insert Movies (excluding any movies that exist in Anime)
         INSERT INTO sqlite_db.search_index (title, original_title, casts, media_type, item_id, year, poster_path, rating)
         SELECT title, original_title, casts, 'movie', imdb_id, year, poster_path, imdb_rating
         FROM sqlite_db.movies
         WHERE imdb_id NOT IN (SELECT imdb_id FROM sqlite_db.anime WHERE imdb_id LIKE 'tt%');
 
-        -- 3. Insert Shows (excluding any shows that exist in Anime)
         INSERT INTO sqlite_db.search_index (title, original_title, casts, media_type, item_id, year, poster_path, rating)
         SELECT title, original_title, casts, 'show', imdb_id, start_year, poster_path, imdb_rating
         FROM sqlite_db.shows
