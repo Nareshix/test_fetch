@@ -1,4 +1,5 @@
 aiohttp
-uvloop
-orjson
 duckdb
+orjson
+uvloop
+requests

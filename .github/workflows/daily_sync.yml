@@ -2,7 +2,7 @@ name: Daily Media Sync & Release
 
 on:
   schedule:
-    - cron: '0 9 * * *' # Daily at 09:00 UTC
+    - cron: '0 9 * * *' # Every day at 09:00 UTC
   workflow_dispatch:
     inputs:
       force_full:
@@ -19,7 +19,7 @@ jobs:
     outputs:
       has_release: ${{ steps.check.outputs.has_release }}
     steps:
-      - name: Check for latest release
+      - name: Check for latest master release
         id: check
         run: |
           if [ "${{ inputs.force_full }}" = "true" ]; then
@@ -32,9 +32,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # ====================================================
-  # PATH A: INCREMENTAL UPDATE (~3 MINS)
-  # ====================================================
   incremental-sync:
     needs: check-mode
     if: needs.check-mode.outputs.has_release == 'true'
@@ -50,7 +47,7 @@ jobs:
 
       - name: Download Previous Master Dataset
         run: |
-          echo "[*] Downloading latest master release..."
+          echo "[*] Downloading latest release files..."
           gh release download --pattern "*.csv.gz" --dir .
           mv movies.csv.gz movies_master.csv.gz
           mv shows.csv.gz shows_master.csv.gz
@@ -67,7 +64,7 @@ jobs:
           python -u movies.py incremental
           python -u shows.py incremental
 
-      - name: Refresh All IMDb Ratings
+      - name: Refresh All IMDb Ratings & Episode Stats
         run: |
           python -u movies.py merge movies_master.csv.gz
           python -u shows.py merge shows_master.csv.gz seasons_master.csv.gz
@@ -78,7 +75,7 @@ jobs:
       - name: Build Master SQLite DB with FTS5 Search
         run: python -u build_master_db.py
 
-      - name: Compress Database
+      - name: Compress Master Database
         run: gzip -9 -c media.sqlite > media.sqlite.gz
 
       - name: Get current date tag

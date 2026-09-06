@@ -1,7 +1,7 @@
 import os
 import duckdb
 
-print("[*] Building unified Master SQLite Database from CSV tables...", flush=True)
+print("[*] Building Master SQLite Database with Deduplicated FTS5 Search...", flush=True)
 
 if os.path.exists("media.sqlite"):
     os.remove("media.sqlite")
@@ -18,15 +18,17 @@ conn.execute("""
 """)
 
 # 2. Attach Anime database if present
-if os.path.exists("media.db"):
-    conn.execute("ATTACH 'media.db' AS anime_db (TYPE SQLITE);")
+has_anime = os.path.exists("anime.db")
+if has_anime:
+    conn.execute("ATTACH 'anime.db' AS anime_db (TYPE SQLITE);")
     conn.execute("""
         CREATE TABLE sqlite_db.anime AS SELECT * FROM anime_db.anime;
         CREATE TABLE sqlite_db.franchise_timeline AS SELECT * FROM anime_db.franchise_timeline;
         CREATE TABLE sqlite_db.anime_recommendation AS SELECT * FROM anime_db.anime_recommendation;
     """)
 
-# 3. Create Indexes for Lookups
+# 3. Create Look-up Indexes
+print("[*] Building B-Tree indexes...", flush=True)
 conn.execute("""
     CREATE UNIQUE INDEX idx_movies_imdb ON sqlite_db.movies(imdb_id);
     CREATE INDEX idx_movies_tmdb ON sqlite_db.movies(tmdb_id);
@@ -36,7 +38,16 @@ conn.execute("""
     CREATE INDEX idx_seasons_tmdb ON sqlite_db.seasons(show_tmdb_id, season_number);
 """)
 
-# 4. Build Unified FTS5 Search Index
+if has_anime:
+    conn.execute("""
+        CREATE INDEX idx_anime_imdb ON sqlite_db.anime(imdb_id);
+        CREATE INDEX idx_timeline_member ON sqlite_db.franchise_timeline(member_id);
+        CREATE INDEX idx_timeline_root ON sqlite_db.franchise_timeline(root_id);
+        CREATE INDEX idx_rec_anime ON sqlite_db.anime_recommendation(anime_id);
+    """)
+
+# 4. Build Unified FTS5 Search Index (Deduplicating Overlaps)
+print("[*] Populating Unified FTS5 Search Index...", flush=True)
 conn.execute("""
     CREATE VIRTUAL TABLE sqlite_db.search_index USING fts5(
         title,
@@ -48,15 +59,10 @@ conn.execute("""
         poster_path UNINDEXED,
         rating UNINDEXED
     );
-
-    INSERT INTO sqlite_db.search_index (title, original_title, casts, media_type, item_id, year, poster_path, rating)
-    SELECT title, original_title, casts, 'movie', imdb_id, year, poster_path, imdb_rating FROM sqlite_db.movies;
-
-    INSERT INTO sqlite_db.search_index (title, original_title, casts, media_type, item_id, year, poster_path, rating)
-    SELECT title, original_title, casts, 'show', imdb_id, start_year, poster_path, imdb_rating FROM sqlite_db.shows;
 """)
 
-if os.path.exists("media.db"):
+if has_anime:
+    # 1. Insert Anime FIRST (Anime gets priority for search)
     conn.execute("""
         INSERT INTO sqlite_db.search_index (title, original_title, casts, media_type, item_id, year, poster_path, rating)
         SELECT
@@ -69,10 +75,27 @@ if os.path.exists("media.db"):
             cover_url AS poster_path,
             rating
         FROM sqlite_db.anime;
+
+        -- 2. Insert Movies (excluding any movies that exist in Anime)
+        INSERT INTO sqlite_db.search_index (title, original_title, casts, media_type, item_id, year, poster_path, rating)
+        SELECT title, original_title, casts, 'movie', imdb_id, year, poster_path, imdb_rating
+        FROM sqlite_db.movies
+        WHERE imdb_id NOT IN (SELECT imdb_id FROM sqlite_db.anime WHERE imdb_id LIKE 'tt%');
+
+        -- 3. Insert Shows (excluding any shows that exist in Anime)
+        INSERT INTO sqlite_db.search_index (title, original_title, casts, media_type, item_id, year, poster_path, rating)
+        SELECT title, original_title, casts, 'show', imdb_id, start_year, poster_path, imdb_rating
+        FROM sqlite_db.shows
+        WHERE imdb_id NOT IN (SELECT imdb_id FROM sqlite_db.anime WHERE imdb_id LIKE 'tt%');
+    """)
+else:
+    conn.execute("""
+        INSERT INTO sqlite_db.search_index (title, original_title, casts, media_type, item_id, year, poster_path, rating)
+        SELECT title, original_title, casts, 'movie', imdb_id, year, poster_path, imdb_rating FROM sqlite_db.movies;
+
+        INSERT INTO sqlite_db.search_index (title, original_title, casts, media_type, item_id, year, poster_path, rating)
+        SELECT title, original_title, casts, 'show', imdb_id, start_year, poster_path, imdb_rating FROM sqlite_db.shows;
     """)
 
 conn.close()
-print(
-    "[+] Master SQLite Database built at 'media.sqlite' with sub-millisecond FTS5 search!",
-    flush=True,
-)
+print("[+] Master SQLite Database created successfully at 'media.sqlite'!", flush=True)

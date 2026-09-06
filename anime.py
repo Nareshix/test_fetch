@@ -6,14 +6,16 @@ import sys
 import time
 import urllib.request
 from collections import defaultdict, deque
+import requests
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 FRIBB_JSON_PATH = os.path.join(DATA_DIR, "anime-list-mini.json")
 CSV_PATH = os.path.join(DATA_DIR, "anilist_anime_data_complete.csv")
-DB_PATH = "media.db"
+DB_PATH = "anime.db"
 
 csv.field_size_limit(2147483647)
+ANILIST_API = "https://graphql.anilist.co"
 
 
 def download_prerequisites():
@@ -56,7 +58,7 @@ def run_anime_pipeline():
     download_prerequisites()
     if not os.path.exists(CSV_PATH):
         print(
-            f"[-] Missing {CSV_PATH}. Place complete AniList export in data/ folder.",
+            f"[-] Missing {CSV_PATH}. Make sure the AniList CSV dataset is in data/ folder.",
             flush=True,
         )
         return
@@ -169,7 +171,6 @@ def run_anime_pipeline():
                 "relations": relations,
             }
 
-    # Build Prequel / Sequel Spines
     spine_adj = defaultdict(set)
     for m_id, m in media_store.items():
         for rel in m["relations"]:
@@ -294,6 +295,9 @@ def run_anime_pipeline():
         for rank, rec_id in enumerate(recs[:12], start=1):
             if rec_id in media_store:
                 recommendation_records.append((a_id, rec_id, rank))
+
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
 
     print(
         f"[*] Writing {len(anime_records):,} anime titles to SQLite at {DB_PATH}...",
