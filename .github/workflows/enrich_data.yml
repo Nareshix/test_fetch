@@ -9,8 +9,12 @@ permissions:
   contents: write
 
 jobs:
-  scrape-and-release:
+  scrape-shards:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3] # 4 parallel runners
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -24,17 +28,53 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Scraper
+      - name: Run Shard Scraper
         env:
           TMDB_API_KEY_MOVIES: ${{ secrets.TMDB_API_KEY_MOVIES }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_TOTAL: 4
           PYTHONUNBUFFERED: "1"
         run: python -u movies.py
+
+      - name: Upload Shard Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: movies_shard_${{ matrix.shard }}.csv.gz
+          retention-days: 1
+
+  merge-and-release:
+    needs: scrape-shards
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install DuckDB
+        run: pip install duckdb
+
+      - name: Download all Shard Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: shards
+          merge-multiple: true
+
+      - name: Merge Shards with DuckDB
+        run: |
+          python -c "
+          import duckdb
+          print('[*] Merging all 4 shard CSVs into unified dataset...')
+          duckdb.execute(\"COPY (SELECT * FROM read_csv_auto('shards/movies_shard_*.csv.gz')) TO 'movies.csv.gz' (HEADER, COMPRESSION 'gzip');\")
+          print('[+] Merge complete!')
+          "
 
       - name: Get current date tag
         id: date
         run: echo "tag=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
 
-      - name: Create GitHub Release and Upload Files
+      - name: Create GitHub Release and Upload
         uses: softprops/action-gh-release@v3
         with:
           tag_name: tmdb-movies-${{ steps.date.outputs.tag }}

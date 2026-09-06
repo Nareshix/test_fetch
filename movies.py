@@ -1,22 +1,31 @@
 import asyncio
 import datetime
 import os
+import time
 import aiohttp
 import duckdb
 import orjson
 import uvloop
 
-# Install C-based libuv event loop for maximum network throughput
 uvloop.install()
 
 TMDB_API_KEY_MOVIES = os.environ.get("TMDB_API_KEY_MOVIES")
+SHARD_INDEX = int(os.environ.get("SHARD_INDEX", 0))
+SHARD_TOTAL = int(os.environ.get("SHARD_TOTAL", 1))
+
 CONCURRENCY = 40
-DB_FILE = "movies.duckdb"
+DB_FILE = f"movies_shard_{SHARD_INDEX}.duckdb"
+CSV_FILE = f"movies_shard_{SHARD_INDEX}.csv.gz"
 
 HEADERS = {
     "Authorization": f"Bearer {TMDB_API_KEY_MOVIES}",
     "Accept": "application/json",
 }
+
+# Global event to pause all workers together during a 429 cooldown
+pause_event = asyncio.Event()
+pause_event.set()
+pause_lock = asyncio.Lock()
 
 
 def init_db():
@@ -57,37 +66,45 @@ async def download_tmdb_dump(session):
         (now - datetime.timedelta(days=1)).strftime("%m_%d_%Y"),
     ]
 
-    dump_filename = "movie_ids.json.gz"
+    dump_filename = f"movie_ids_{SHARD_INDEX}.json.gz"
     downloaded = False
 
     for date_str in candidate_dates:
         url = f"http://files.tmdb.org/p/exports/movie_ids_{date_str}.json.gz"
-        print(f"[*] Checking dump: {url}")
+        print(f"[*] [Shard {SHARD_INDEX}] Checking dump: {url}", flush=True)
         async with session.get(url) as resp:
             if resp.status == 200:
                 with open(dump_filename, "wb") as f:
                     f.write(await resp.read())
-                print(f"[+] Downloaded dump for {date_str}")
+                print(
+                    f"[+] [Shard {SHARD_INDEX}] Downloaded dump for {date_str}",
+                    flush=True,
+                )
                 downloaded = True
                 break
 
     if not downloaded:
         raise RuntimeError("Failed to download any valid TMDB daily dump.")
 
-    print("[*] Parsing dump using DuckDB C++ engine...")
-    # DuckDB reads and filters the gzipped JSON directly in ~1 second
-    query = f"""
-        SELECT id FROM read_json('{dump_filename}')
-        WHERE adult = false
-    """
+    # DuckDB filters adult movies out in C++
+    query = f"SELECT id FROM read_json('{dump_filename}') WHERE adult = false"
     rows = duckdb.sql(query).fetchall()
-    movie_ids = [r[0] for r in rows]
+    all_movie_ids = [r[0] for r in rows]
 
-    # Clean up dump file
     if os.path.exists(dump_filename):
         os.remove(dump_filename)
 
-    print(f"[*] Total non-adult movies to fetch: {len(movie_ids):,}")
+    # Shard slicing: partition across runners
+    movie_ids = [
+        m_id
+        for idx, m_id in enumerate(all_movie_ids)
+        if idx % SHARD_TOTAL == SHARD_INDEX
+    ]
+
+    print(
+        f"[*] Total non-adult movies: {len(all_movie_ids):,} | Assigned to Shard {SHARD_INDEX}/{SHARD_TOTAL}: {len(movie_ids):,}",
+        flush=True,
+    )
     return movie_ids
 
 
@@ -95,11 +112,13 @@ async def fetch_movie(session, semaphore, movie_id, retries=5):
     url = f"https://api.themoviedb.org/3/movie/{movie_id}?append_to_response=credits"
 
     for attempt in range(retries):
+        # Wait if another worker triggered a rate-limit cooldown
+        await pause_event.wait()
+
         async with semaphore:
             try:
                 async with session.get(url, headers=HEADERS) as resp:
                     if resp.status == 200:
-                        # Fast Rust JSON parser
                         data = orjson.loads(await resp.read())
                         credits = data.get("credits", {})
                         cast_list = credits.get("cast", [])
@@ -113,7 +132,7 @@ async def fetch_movie(session, semaphore, movie_id, retries=5):
                             else None
                         )
 
-                        return (
+                        record = (
                             data.get("id"),
                             data.get("imdb_id"),
                             data.get("backdrop_path"),
@@ -159,22 +178,47 @@ async def fetch_movie(session, semaphore, movie_id, retries=5):
                                 [p.get("logo_path") for p in prod_list]
                             ).decode("utf-8"),
                         )
+                        return "OK", record, data.get("title"), year
 
                     elif resp.status == 404:
-                        return None
+                        return "404", None, None, None
 
                     elif resp.status == 429:
-                        retry_after = float(resp.headers.get("Retry-After", 1.5))
-                        await asyncio.sleep(retry_after + 0.1)
+                        retry_after = float(resp.headers.get("Retry-After", 2.0))
+
+                        # Lock so only one worker controls the countdown timer in the log
+                        async with pause_lock:
+                            if pause_event.is_set():
+                                pause_event.clear()
+                                print(
+                                    f"\n[!] ⚠️ Rate limit (HTTP 429) hit! Pausing all workers for {retry_after:.1f}s:",
+                                    flush=True,
+                                )
+                                remaining = retry_after
+                                while remaining > 0:
+                                    print(
+                                        f"    ⏳ Waiting... {remaining:.1f}s remaining",
+                                        flush=True,
+                                    )
+                                    step = min(1.0, remaining)
+                                    await asyncio.sleep(step)
+                                    remaining -= step
+                                print(
+                                    "    ✅ Cooldown complete! Resuming workers...\n",
+                                    flush=True,
+                                )
+                                pause_event.set()
+
+                        await pause_event.wait()
                         continue
 
                     else:
-                        await asyncio.sleep(1 * (attempt + 1))
+                        await asyncio.sleep(0.5 * (attempt + 1))
 
             except (aiohttp.ClientError, asyncio.TimeoutError):
-                await asyncio.sleep(1 * (attempt + 1))
+                await asyncio.sleep(0.5 * (attempt + 1))
 
-    return None
+    return "ERR", None, None, None
 
 
 async def writer_worker(queue):
@@ -186,7 +230,7 @@ async def writer_worker(queue):
         if record is None:
             break
         batch.append(record)
-        if len(batch) >= 500:
+        if len(batch) >= 250:
             conn.executemany(
                 "INSERT OR REPLACE INTO movies VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 batch,
@@ -202,14 +246,18 @@ async def writer_worker(queue):
 
 
 async def export_csv():
-    print("[*] DuckDB exporting table directly to compressed CSV...")
+    print(
+        f"[*] DuckDB exporting Shard {SHARD_INDEX} directly to {CSV_FILE}...",
+        flush=True,
+    )
     conn = duckdb.connect(DB_FILE)
-    # DuckDB can export directly to gzip-compressed CSV via SQL
     conn.execute(
-        "COPY movies TO 'movies.csv.gz' (HEADER, DELIMITER ',', COMPRESSION 'gzip');"
+        f"COPY movies TO '{CSV_FILE}' (HEADER, DELIMITER ',', COMPRESSION 'gzip');"
     )
     conn.close()
-    print("[*] Exported to movies.csv.gz")
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+    print(f"[+] Shard {SHARD_INDEX} exported successfully.", flush=True)
 
 
 async def main():
@@ -218,24 +266,48 @@ async def main():
     timeout = aiohttp.ClientTimeout(total=25)
     connector = aiohttp.TCPConnector(limit=CONCURRENCY, keepalive_timeout=60)
     semaphore = asyncio.Semaphore(CONCURRENCY)
-    queue = asyncio.Queue(maxsize=2000)
+    queue = asyncio.Queue(maxsize=1500)
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         movie_ids = await download_tmdb_dump(session)
         writer_task = asyncio.create_task(writer_worker(queue))
 
         processed = 0
+        success_count = 0
+        not_found_count = 0
+        error_count = 0
         total = len(movie_ids)
+        start_time = time.time()
 
         async def worker(m_id):
-            nonlocal processed
-            res = await fetch_movie(session, semaphore, m_id)
-            if res:
-                await queue.put(res)
+            nonlocal processed, success_count, not_found_count, error_count
+            status, rec, title, year = await fetch_movie(session, semaphore, m_id)
+
+            if status == "OK":
+                success_count += 1
+                await queue.put(rec)
+            elif status == "404":
+                not_found_count += 1
+            else:
+                error_count += 1
+
             processed += 1
-            if processed % 2000 == 0 or processed == total:
+
+            # Log updates every 50 items so the terminal moves continuously in real-time
+            if processed % 50 == 0 or processed == total:
+                elapsed = max(1, time.time() - start_time)
+                speed = processed / elapsed
+                pct = (processed / total) * 100
+                display_title = (
+                    (title[:25] + "...")
+                    if title and len(title) > 25
+                    else (title or "N/A")
+                )
                 print(
-                    f"Progress: {processed:,} / {total:,} ({processed / total * 100:.1f}%)"
+                    f"[{SHARD_INDEX}/{SHARD_TOTAL}] {processed:,}/{total:,} ({pct:5.1f}%) | "
+                    f"{speed:4.1f} req/s | OK: {success_count:,} | 404: {not_found_count} | "
+                    f"Q: {queue.qsize():3d} | '{display_title}' ({year or '?'})",
+                    flush=True,
                 )
 
         await asyncio.gather(*(worker(m_id) for m_id in movie_ids))
@@ -244,7 +316,7 @@ async def main():
         await writer_task
 
     await export_csv()
-    print("[*] Completed successfully.")
+    print(f"[*] Shard {SHARD_INDEX} finished complete run.", flush=True)
 
 
 if __name__ == "__main__":
