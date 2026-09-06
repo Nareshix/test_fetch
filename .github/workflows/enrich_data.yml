@@ -2,9 +2,8 @@ name: Scrape TMDB Movies Daily
 
 on:
   schedule:
-    # Runs daily at 09:00 UTC (shortly after TMDB publishes its daily ID dump)
     - cron: '0 9 * * *'
-  workflow_dispatch: # Allows manual trigger anytime from the Actions UI
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -28,19 +27,8 @@ jobs:
       - name: Run Scraper
         env:
           TMDB_API_KEY_MOVIES: ${{ secrets.TMDB_API_KEY_MOVIES }}
-        run: python movies.py
-
-      - name: Export to CSV and Compress Files
-        run: |
-          echo "[*] Exporting SQLite to CSV..."
-          sqlite3 -header -csv movies.db "SELECT * FROM movies;" > movies.csv
-
-          echo "[*] Compressing CSV and SQLite database..."
-          gzip -9 -c movies.csv > movies.csv.gz
-          gzip -9 -c movies.db > movies.db.gz
-
-          # Clean up uncompressed files to save runner disk space
-          rm movies.csv movies.db
+          PYTHONUNBUFFERED: "1"
+        run: python -u movies.py
 
       - name: Get current date tag
         id: date
@@ -53,8 +41,6 @@ jobs:
           name: "TMDB Movies Complete Dataset (${{ steps.date.outputs.tag }})"
           draft: false
           prerelease: false
-          files: |
-            movies.csv.gz
-            movies.db.gz
+          files: movies.csv.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

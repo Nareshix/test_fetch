@@ -1,1 +1,4 @@
 aiohttp
+uvloop
+orjson
+duckdb
