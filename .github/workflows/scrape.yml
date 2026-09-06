@@ -1,0 +1,60 @@
+name: Scrape TMDB Movies Daily
+
+on:
+  schedule:
+    # Runs daily at 09:00 UTC (shortly after TMDB publishes its daily ID dump)
+    - cron: '0 9 * * *'
+  workflow_dispatch: # Allows manual trigger anytime from the Actions UI
+
+permissions:
+  contents: write
+
+jobs:
+  scrape-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Scraper
+        env:
+          TMDB_API_KEY_MOVIES: ${{ secrets.TMDB_API_KEY_MOVIES }}
+        run: python movies.py
+
+      - name: Export to CSV and Compress Files
+        run: |
+          echo "[*] Exporting SQLite to CSV..."
+          sqlite3 -header -csv movies.db "SELECT * FROM movies;" > movies.csv
+
+          echo "[*] Compressing CSV and SQLite database..."
+          gzip -9 -c movies.csv > movies.csv.gz
+          gzip -9 -c movies.db > movies.db.gz
+
+          # Clean up uncompressed files to save runner disk space
+          rm movies.csv movies.db
+
+      - name: Get current date tag
+        id: date
+        run: echo "tag=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release and Upload Files
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: tmdb-movies-${{ steps.date.outputs.tag }}
+          name: "TMDB Movies Complete Dataset (${{ steps.date.outputs.tag }})"
+          draft: false
+          prerelease: false
+          files: |
+            movies.csv.gz
+            movies.db.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

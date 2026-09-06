@@ -1,218 +1,224 @@
+import asyncio
+import datetime
+import gzip
+import json
 import os
 import sqlite3
-import urllib.request
-import duckdb
+import aiohttp
 
-FILES = [
-    "title.basics.tsv.gz",
-    "title.ratings.tsv.gz",
-    "title.principals.tsv.gz",
-    "name.basics.tsv.gz",
-]
-BASE_URL = "https://datasets.imdbws.com/"
+# Reads your v4 Read Access Token from GitHub Secrets / Environment
+TMDB_API_KEY_MOVIES = os.environ.get("TMDB_API_KEY_MOVIES")
 
+# Concurrency pool (35-40 keeps TMDB throughput high without instant drops)
+CONCURRENCY = 40
+DB_FILE = "movies.db"
 
-def download_progress(block_num, block_size, total_size):
-    downloaded = block_num * block_size
-    if total_size > 0:
-        percent = (downloaded / total_size) * 100
-        mb = downloaded / (1024 * 1024)
-        total_mb = total_size / (1024 * 1024)
-        print(
-            f"\rDownloading: {percent:.1f}% ({mb:.1f}/{total_mb:.1f} MB)",
-            end="",
-            flush=True,
-        )
+HEADERS = {
+    "Authorization": f"Bearer {TMDB_API_KEY_MOVIES}",
+    "Accept": "application/json",
+}
 
 
-def download_files():
-    for filename in FILES:
-        if not os.path.exists(filename):
-            print(f"\nDownloading {filename}...")
-            urllib.request.urlretrieve(
-                BASE_URL + filename, filename, reporthook=download_progress
-            )
-            print()
-        else:
-            print(f"Using existing {filename}")
-
-
-def build_movies_db():
-    download_files()
-
-    print("\nConnecting to DuckDB engine...")
-    conn_duck = duckdb.connect()
-    conn_duck.execute("SET enable_progress_bar = true;")
-
-    query = """
-    WITH movie_basics AS (
-        SELECT
-            tconst,
-            primaryTitle AS title,
-            originalTitle AS original_title,
-            TRY_CAST(startYear AS INTEGER) AS year,
-            TRY_CAST(runtimeMinutes AS INTEGER) AS runtime_minutes,
-            genres
-        FROM read_csv('title.basics.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True)
-        WHERE titleType = 'movie'
-    ),
-    ratings AS (
-        SELECT
-            tconst,
-            TRY_CAST(averageRating AS FLOAT) AS rating,
-            TRY_CAST(numVotes AS INTEGER) AS vote_count
-        FROM read_csv('title.ratings.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True)
-    ),
-    principals AS (
-        SELECT
-            p.tconst,
-            TRY_CAST(p.ordering AS INTEGER) AS ordering,
-            p.nconst,
-            p.category,
-            p.characters,
-            n.primaryName AS name
-        FROM read_csv('title.principals.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True) p
-        JOIN read_csv('name.basics.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True) n
-            ON p.nconst = n.nconst
-        WHERE p.tconst IN (SELECT tconst FROM movie_basics)
-          AND p.category IN ('actor', 'actress', 'director', 'writer', 'producer', 'composer', 'cinematographer', 'editor')
-    ),
-    distinct_principals AS (
-        SELECT
-            tconst,
-            ordering,
-            nconst,
-            name,
-            category,
-            characters,
-            ROW_NUMBER() OVER (
-                PARTITION BY tconst, category, nconst
-                ORDER BY ordering
-            ) AS dup_rank
-        FROM principals
-    ),
-    ranked_principals AS (
-        SELECT
-            tconst,
-            ordering,
-            nconst,
-            name,
-            category,
-            CASE
-                WHEN characters IS NOT NULL AND characters != '' AND characters != '[]' THEN
-                    name || ' (as ' || replace(replace(replace(replace(characters, '["', ''), '"]', ''), '","', ', '), '", "', ', ') || ')'
-                ELSE name
-            END AS actor_display,
-            ROW_NUMBER() OVER (
-                PARTITION BY tconst, (category IN ('actor', 'actress'))
-                ORDER BY ordering
-            ) AS cast_rank
-        FROM distinct_principals
-        WHERE dup_rank = 1
-    ),
-    crew_agg AS (
-        SELECT
-            tconst,
-            string_agg(actor_display, ', ' ORDER BY ordering) FILTER (WHERE category IN ('actor', 'actress') AND cast_rank <= 6) AS cast,
-            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category IN ('actor', 'actress') AND cast_rank <= 6) AS cast_ids,
-            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category = 'director') AS directors,
-            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category = 'director') AS director_ids,
-            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category = 'writer') AS writers,
-            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category = 'writer') AS writer_ids,
-            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category = 'producer') AS producers,
-            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category = 'producer') AS producer_ids,
-            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category = 'composer') AS composers,
-            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category = 'composer') AS composer_ids,
-            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category = 'cinematographer') AS cinematographers,
-            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category = 'cinematographer') AS cinematographer_ids,
-            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category = 'editor') AS editors,
-            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category = 'editor') AS editor_ids
-        FROM ranked_principals
-        GROUP BY tconst
-    )
-    SELECT
-        b.tconst,
-        b.title,
-        b.original_title,
-        b.year,
-        b.runtime_minutes,
-        b.genres,
-        r.rating,
-        r.vote_count,
-        c.cast,
-        c.cast_ids,
-        c.directors,
-        c.director_ids,
-        c.writers,
-        c.writer_ids,
-        c.producers,
-        c.producer_ids,
-        c.composers,
-        c.composer_ids,
-        c.cinematographers,
-        c.cinematographer_ids,
-        c.editors,
-        c.editor_ids
-    FROM movie_basics b
-    LEFT JOIN ratings r ON b.tconst = r.tconst
-    LEFT JOIN crew_agg c ON b.tconst = c.tconst
-    """
-
-    print("Executing query directly on compressed files...")
-    results = conn_duck.execute(query).fetchall()
-    print(f"\nExtracted {len(results):,} movies.")
-
-    print("Writing records to movies.db...")
-    if os.path.exists("movies.db"):
-        os.remove("movies.db")
-
-    conn_sqlite = sqlite3.connect("movies.db")
-    cursor = conn_sqlite.cursor()
-
-    cursor.execute(
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
         """
-        CREATE TABLE movies (
-            tconst TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS movies (
+            tmdb_id INTEGER PRIMARY KEY,
+            imdb_id TEXT,
+            backdrop_path TEXT,
+            poster_path TEXT,
+            year INTEGER,
+            runtime INTEGER,
             title TEXT,
             original_title TEXT,
-            year INTEGER,
-            runtime_minutes INTEGER,
+            status TEXT,
             genres TEXT,
-            rating REAL,
-            vote_count INTEGER,
-            cast TEXT,
-            cast_ids TEXT,
-            directors TEXT,
-            director_ids TEXT,
-            writers TEXT,
-            writer_ids TEXT,
-            producers TEXT,
-            producer_ids TEXT,
-            composers TEXT,
-            composer_ids TEXT,
-            cinematographers TEXT,
-            cinematographer_ids TEXT,
-            editors TEXT,
-            editor_ids TEXT
+            description TEXT,
+            casts TEXT,
+            casts_id TEXT,
+            casts_image_path TEXT,
+            crews TEXT,
+            crews_id TEXT,
+            crews_image_path TEXT,
+            prod_studio TEXT,
+            prod_studio_id TEXT,
+            prod_studio_image_path TEXT
         )
     """
     )
+    conn.commit()
+    conn.close()
 
-    placeholders = ", ".join(["?"] * 22)
-    cursor.executemany(f"INSERT INTO movies VALUES ({placeholders})", results)
 
-    print("Creating indexes...")
-    cursor.execute("CREATE INDEX idx_movies_title ON movies(title)")
-    cursor.execute("CREATE INDEX idx_movies_original_title ON movies(original_title)")
-    cursor.execute("CREATE INDEX idx_movies_year ON movies(year)")
-    cursor.execute("CREATE INDEX idx_movies_rating ON movies(rating)")
-    cursor.execute("CREATE INDEX idx_movies_vote_count ON movies(vote_count)")
+async def download_tmdb_dump(session):
+    # Try today's date first, fallback to yesterday if export is not ready yet
+    now = datetime.datetime.now(datetime.timezone.utc)
+    candidate_dates = [
+        now.strftime("%m_%d_%Y"),
+        (now - datetime.timedelta(days=1)).strftime("%m_%d_%Y"),
+    ]
 
-    conn_sqlite.commit()
-    conn_sqlite.close()
-    conn_duck.close()
-    print("Done! Database ready at movies.db")
+    compressed_data = None
+    for date_str in candidate_dates:
+        url = f"http://files.tmdb.org/p/exports/movie_ids_{date_str}.json.gz"
+        print(f"[*] Checking dump: {url}")
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                compressed_data = await resp.read()
+                print(f"[+] Downloaded dump for {date_str}")
+                break
+
+    if not compressed_data:
+        raise RuntimeError("Failed to download any valid TMDB daily dump.")
+
+    decompressed = gzip.decompress(compressed_data).decode("utf-8")
+    movie_ids = []
+
+    for line in decompressed.strip().split("\n"):
+        if not line:
+            continue
+        item = json.loads(line)
+        # Only filter: ignore adult content
+        if not item.get("adult", False):
+            movie_ids.append(item["id"])
+
+    print(f"[*] Total non-adult movies to fetch: {len(movie_ids):,}")
+    return movie_ids
+
+
+async def fetch_movie(session, semaphore, movie_id, retries=5):
+    url = f"https://api.themoviedb.org/3/movie/{movie_id}?append_to_response=credits"
+
+    for attempt in range(retries):
+        async with semaphore:
+            try:
+                async with session.get(url, headers=HEADERS) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        credits = data.get("credits", {})
+                        cast_list = credits.get("cast", [])
+                        crew_list = credits.get("crew", [])
+                        prod_list = data.get("production_companies", [])
+
+                        release_date = data.get("release_date") or ""
+                        year = (
+                            int(release_date[:4])
+                            if len(release_date) >= 4 and release_date[:4].isdigit()
+                            else None
+                        )
+
+                        return (
+                            data.get("id"),
+                            data.get("imdb_id"),
+                            data.get("backdrop_path"),
+                            data.get("poster_path"),
+                            year,
+                            data.get("runtime"),
+                            data.get("title"),
+                            data.get("original_title"),
+                            data.get("status"),
+                            json.dumps(
+                                [
+                                    g.get("name")
+                                    for g in data.get("genres", [])
+                                    if g.get("name")
+                                ]
+                            ),
+                            data.get("overview"),
+                            json.dumps([c.get("name") for c in cast_list]),
+                            json.dumps([c.get("id") for c in cast_list]),
+                            json.dumps([c.get("profile_path") for c in cast_list]),
+                            json.dumps([c.get("name") for c in crew_list]),
+                            json.dumps([c.get("id") for c in crew_list]),
+                            json.dumps([c.get("profile_path") for c in crew_list]),
+                            json.dumps([p.get("name") for p in prod_list]),
+                            json.dumps([p.get("id") for p in prod_list]),
+                            json.dumps([p.get("logo_path") for p in prod_list]),
+                        )
+
+                    elif resp.status == 404:
+                        return None
+
+                    elif resp.status == 429:
+                        # Follow the Retry-After header provided by TMDB
+                        retry_after = float(resp.headers.get("Retry-After", 1.5))
+                        wait_time = retry_after + 0.1
+                        await asyncio.sleep(wait_time)
+                        continue
+
+                    else:
+                        await asyncio.sleep(1 * (attempt + 1))
+
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                await asyncio.sleep(1 * (attempt + 1))
+
+    return None
+
+
+async def writer_worker(queue):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    batch = []
+
+    while True:
+        record = await queue.get()
+        if record is None:
+            break
+        batch.append(record)
+        # Commit in batches of 250 to keep memory footprint minimal
+        if len(batch) >= 250:
+            c.executemany(
+                "INSERT OR REPLACE INTO movies VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                batch,
+            )
+            conn.commit()
+            batch.clear()
+
+    if batch:
+        c.executemany(
+            "INSERT OR REPLACE INTO movies VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            batch,
+        )
+        conn.commit()
+    conn.close()
+
+
+async def main():
+    init_db()
+
+    timeout = aiohttp.ClientTimeout(total=25)
+    connector = aiohttp.TCPConnector(limit=CONCURRENCY, keepalive_timeout=60)
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    queue = asyncio.Queue(maxsize=1000)
+
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        movie_ids = await download_tmdb_dump(session)
+        writer_task = asyncio.create_task(writer_worker(queue))
+
+        processed = 0
+        total = len(movie_ids)
+
+        async def worker(m_id):
+            nonlocal processed
+            res = await fetch_movie(session, semaphore, m_id)
+            if res:
+                await queue.put(res)
+            processed += 1
+            if processed % 2000 == 0 or processed == total:
+                print(
+                    f"Progress: {processed:,} / {total:,} ({processed / total * 100:.1f}%)"
+                )
+
+        await asyncio.gather(*(worker(m_id) for m_id in movie_ids))
+
+        # Stop database writer and finish
+        await queue.put(None)
+        await writer_task
+
+    print("[*] Completed successfully. Data stored in movies.db")
 
 
 if __name__ == "__main__":
-    build_movies_db()
+    asyncio.run(main())

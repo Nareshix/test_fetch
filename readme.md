@@ -2,26 +2,26 @@
 - imdb_id
 - backdrop_path
 - poster_path
-- year (imdb)
-- runtime (imdb)
-- title (imdb)
-- original_title (imdb) (might remove duplicates)
+- year
+- runtime
+- title
+- original_title
 - rating (imdb)
 - vote_count (imdb)
 - status
-- genres (imdb)
+- genres
 - description
-- casts (imdb)
-- casts_id (imdb)
-- casts_image
-- crews (imdb)
-- crews_id (imdb)
-- crews_image
+- casts
+- casts_id
+- casts_image_path
+- crews
+- crews_id
+- crews_image_path
 - prod studio
 - prod studio id
-- prod studio image
+- prod studio image path
 - imdb recs
-- tmdb recs
+- tmdb recs ()
 
 
 ## Shows
