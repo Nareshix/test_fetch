@@ -1,3 +1,4 @@
+Rn it only does bulk insert first time. after that need to do logc for incremental insert.
 ## Movie
 - imdb_id
 - backdrop_path
