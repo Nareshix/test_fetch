@@ -25,32 +25,32 @@
 
 
 ## Shows
-- imdb_id (imdb)
-- title (imdb)
+- imdb_id
+- title
 - backdrop_path
 - poster_path
-- original_title (imdb) (might remove duplicates)
-- start_year (imdb)
-- end_year (imdb)
+- original_title
+- start_year
+- end_year
 - total_seasons (imdb)
 - total_episodes (imdb)
 - total_time_taken_for_all_episodes (imdb)
 - status
 - rating (imdb)
 - vote_count (imdb)
-- genres (imdb)
+- genres
 - description
 - season rating (imdb)
 - season vote_count (imdb)
 - season total_episodes (imdb)
-- showrunner and creator (imdb)
-- showrunner and creator id (imdb)
+- showrunner and creator
+- showrunner and creator id
 - showrunner and creator image
-- casts (imdb)
-- casts_id (imdb)
+- casts
+- casts_id
 - casts_image
-- crews (imdb)
-- crews_id (imdb)
+- crews
+- crews_id
 - crews_image
 - original network
 - original network id

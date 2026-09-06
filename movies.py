@@ -1,7 +1,9 @@
 import asyncio
 import datetime
 import os
+import sys
 import time
+import urllib.request
 import aiohttp
 import duckdb
 import orjson
@@ -13,7 +15,7 @@ TMDB_API_KEY_MOVIES = os.environ.get("TMDB_API_KEY_MOVIES")
 SHARD_INDEX = int(os.environ.get("SHARD_INDEX", 0))
 SHARD_TOTAL = int(os.environ.get("SHARD_TOTAL", 1))
 
-CONCURRENCY = 40
+CONCURRENCY = 20
 DB_FILE = f"movies_shard_{SHARD_INDEX}.duckdb"
 CSV_FILE = f"movies_shard_{SHARD_INDEX}.csv.gz"
 
@@ -22,12 +24,14 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-# Global event to pause all workers together during a 429 cooldown
 pause_event = asyncio.Event()
 pause_event.set()
 pause_lock = asyncio.Lock()
 
 
+# ==========================================
+# SCRAPER LOGIC
+# ==========================================
 def init_db():
     conn = duckdb.connect(DB_FILE)
     conn.execute(
@@ -86,7 +90,6 @@ async def download_tmdb_dump(session):
     if not downloaded:
         raise RuntimeError("Failed to download any valid TMDB daily dump.")
 
-    # DuckDB filters adult movies out in C++
     query = f"SELECT id FROM read_json('{dump_filename}') WHERE adult = false"
     rows = duckdb.sql(query).fetchall()
     all_movie_ids = [r[0] for r in rows]
@@ -94,7 +97,6 @@ async def download_tmdb_dump(session):
     if os.path.exists(dump_filename):
         os.remove(dump_filename)
 
-    # Shard slicing: partition across runners
     movie_ids = [
         m_id
         for idx, m_id in enumerate(all_movie_ids)
@@ -112,7 +114,6 @@ async def fetch_movie(session, semaphore, movie_id, retries=5):
     url = f"https://api.themoviedb.org/3/movie/{movie_id}?append_to_response=credits"
 
     for attempt in range(retries):
-        # Wait if another worker triggered a rate-limit cooldown
         await pause_event.wait()
 
         async with semaphore:
@@ -120,6 +121,11 @@ async def fetch_movie(session, semaphore, movie_id, retries=5):
                 async with session.get(url, headers=HEADERS) as resp:
                     if resp.status == 200:
                         data = orjson.loads(await resp.read())
+
+                        imdb_id = data.get("imdb_id")
+                        if not imdb_id or not str(imdb_id).strip():
+                            return "NO_IMDB", None, data.get("title"), None
+
                         credits = data.get("credits", {})
                         cast_list = credits.get("cast", [])
                         crew_list = credits.get("crew", [])
@@ -134,7 +140,7 @@ async def fetch_movie(session, semaphore, movie_id, retries=5):
 
                         record = (
                             data.get("id"),
-                            data.get("imdb_id"),
+                            imdb_id.strip(),
                             data.get("backdrop_path"),
                             data.get("poster_path"),
                             year,
@@ -185,28 +191,23 @@ async def fetch_movie(session, semaphore, movie_id, retries=5):
 
                     elif resp.status == 429:
                         retry_after = float(resp.headers.get("Retry-After", 2.0))
-
-                        # Lock so only one worker controls the countdown timer in the log
                         async with pause_lock:
                             if pause_event.is_set():
                                 pause_event.clear()
                                 print(
-                                    f"\n[!] ⚠️ Rate limit (HTTP 429) hit! Pausing all workers for {retry_after:.1f}s:",
+                                    f"\n[429] Rate limit hit. Pausing all workers for {retry_after:.1f}s:",
                                     flush=True,
                                 )
                                 remaining = retry_after
                                 while remaining > 0:
                                     print(
-                                        f"    ⏳ Waiting... {remaining:.1f}s remaining",
+                                        f"  [429] {remaining:.1f}s remaining...",
                                         flush=True,
                                     )
                                     step = min(1.0, remaining)
                                     await asyncio.sleep(step)
                                     remaining -= step
-                                print(
-                                    "    ✅ Cooldown complete! Resuming workers...\n",
-                                    flush=True,
-                                )
+                                print("  [429] Resuming workers.\n", flush=True)
                                 pause_event.set()
 
                         await pause_event.wait()
@@ -246,10 +247,7 @@ async def writer_worker(queue):
 
 
 async def export_csv():
-    print(
-        f"[*] DuckDB exporting Shard {SHARD_INDEX} directly to {CSV_FILE}...",
-        flush=True,
-    )
+    print(f"[*] Exporting Shard {SHARD_INDEX} to {CSV_FILE}...", flush=True)
     conn = duckdb.connect(DB_FILE)
     conn.execute(
         f"COPY movies TO '{CSV_FILE}' (HEADER, DELIMITER ',', COMPRESSION 'gzip');"
@@ -257,10 +255,10 @@ async def export_csv():
     conn.close()
     if os.path.exists(DB_FILE):
         os.remove(DB_FILE)
-    print(f"[+] Shard {SHARD_INDEX} exported successfully.", flush=True)
+    print(f"[+] Shard {SHARD_INDEX} export complete.", flush=True)
 
 
-async def main():
+async def run_scraper():
     init_db()
 
     timeout = aiohttp.ClientTimeout(total=25)
@@ -274,26 +272,25 @@ async def main():
 
         processed = 0
         success_count = 0
+        no_imdb_count = 0
         not_found_count = 0
-        error_count = 0
         total = len(movie_ids)
         start_time = time.time()
 
         async def worker(m_id):
-            nonlocal processed, success_count, not_found_count, error_count
+            nonlocal processed, success_count, no_imdb_count, not_found_count
             status, rec, title, year = await fetch_movie(session, semaphore, m_id)
 
             if status == "OK":
                 success_count += 1
                 await queue.put(rec)
+            elif status == "NO_IMDB":
+                no_imdb_count += 1
             elif status == "404":
                 not_found_count += 1
-            else:
-                error_count += 1
 
             processed += 1
 
-            # Log updates every 50 items so the terminal moves continuously in real-time
             if processed % 50 == 0 or processed == total:
                 elapsed = max(1, time.time() - start_time)
                 speed = processed / elapsed
@@ -304,20 +301,54 @@ async def main():
                     else (title or "N/A")
                 )
                 print(
-                    f"[{SHARD_INDEX}/{SHARD_TOTAL}] {processed:,}/{total:,} ({pct:5.1f}%) | "
-                    f"{speed:4.1f} req/s | OK: {success_count:,} | 404: {not_found_count} | "
-                    f"Q: {queue.qsize():3d} | '{display_title}' ({year or '?'})",
+                    f"[Shard {SHARD_INDEX}/{SHARD_TOTAL}] {processed:,}/{total:,} ({pct:5.1f}%) | "
+                    f"{speed:4.1f} req/s | OK: {success_count:,} | Ignored (No IMDb): {no_imdb_count:,} | "
+                    f"404: {not_found_count} | '{display_title}' ({year or '?'})",
                     flush=True,
                 )
 
         await asyncio.gather(*(worker(m_id) for m_id in movie_ids))
-
         await queue.put(None)
         await writer_task
 
     await export_csv()
-    print(f"[*] Shard {SHARD_INDEX} finished complete run.", flush=True)
+    print(f"[*] Shard {SHARD_INDEX} completed successfully.", flush=True)
+
+
+# ==========================================
+# MERGE LOGIC
+# ==========================================
+def run_merge():
+    ratings_url = "https://datasets.imdbws.com/title.ratings.tsv.gz"
+    ratings_file = "title.ratings.tsv.gz"
+    output_file = "movies.csv.gz"
+
+    print("[*] Checking IMDb title.ratings dump...", flush=True)
+    if not os.path.exists(ratings_file):
+        print(f"[*] Downloading {ratings_url}...", flush=True)
+        urllib.request.urlretrieve(ratings_url, ratings_file)
+        print("[+] Download complete.", flush=True)
+
+    print("[*] Merging movie shards and joining IMDb ratings...", flush=True)
+    conn = duckdb.connect()
+    query = f"""
+        COPY (
+            SELECT
+                m.*,
+                r.averageRating AS imdb_rating,
+                r.numVotes AS imdb_votes
+            FROM read_csv_auto('movie_shards/movies_shard_*.csv.gz') m
+            LEFT JOIN read_csv('{ratings_file}', delim='\\t', nullstr='\\\\N') r
+                ON m.imdb_id = r.tconst
+        ) TO '{output_file}' (HEADER, COMPRESSION 'gzip');
+    """
+    conn.execute(query)
+    conn.close()
+    print(f"[+] Successfully merged into {output_file}!", flush=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if len(sys.argv) > 1 and sys.argv[1] == "merge":
+        run_merge()
+    else:
+        asyncio.run(run_scraper())

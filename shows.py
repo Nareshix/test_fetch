@@ -1,290 +1,480 @@
+import asyncio
+import datetime
 import os
-import sqlite3
+import sys
+import time
 import urllib.request
+import aiohttp
 import duckdb
+import orjson
+import uvloop
 
-FILES = [
-    "title.basics.tsv.gz",
-    "title.ratings.tsv.gz",
-    "title.episode.tsv.gz",
-    "title.principals.tsv.gz",
-    "name.basics.tsv.gz",
-]
-BASE_URL = "https://datasets.imdbws.com/"
+uvloop.install()
 
+TMDB_API_KEY_SHOWS = os.environ.get("TMDB_API_KEY_SHOWS")
+SHARD_INDEX = int(os.environ.get("SHARD_INDEX", 0))
+SHARD_TOTAL = int(os.environ.get("SHARD_TOTAL", 1))
 
-def download_progress(block_num, block_size, total_size):
-    downloaded = block_num * block_size
-    if total_size > 0:
-        percent = (downloaded / total_size) * 100
-        mb = downloaded / (1024 * 1024)
-        total_mb = total_size / (1024 * 1024)
-        print(
-            f"\rDownloading: {percent:.1f}% ({mb:.1f}/{total_mb:.1f} MB)",
-            end="",
-            flush=True,
-        )
+CONCURRENCY = 20
+DB_FILE = f"shows_shard_{SHARD_INDEX}.duckdb"
+SHOWS_CSV = f"shows_shard_{SHARD_INDEX}.csv.gz"
+SEASONS_CSV = f"seasons_shard_{SHARD_INDEX}.csv.gz"
 
+HEADERS = {
+    "Authorization": f"Bearer {TMDB_API_KEY_SHOWS}",
+    "Accept": "application/json",
+}
 
-def download_files():
-    for filename in FILES:
-        if not os.path.exists(filename):
-            print(f"\nDownloading {filename}...")
-            urllib.request.urlretrieve(
-                BASE_URL + filename, filename, reporthook=download_progress
-            )
-            print()
-        else:
-            print(f"Using existing {filename}")
+pause_event = asyncio.Event()
+pause_event.set()
+pause_lock = asyncio.Lock()
 
 
-def build_shows_database():
-    download_files()
-
-    print("\nConnecting to DuckDB engine...")
-    conn_duck = duckdb.connect()
-    conn_duck.execute("SET enable_progress_bar = true;")
-
-    print("\nStep 1/2: Extracting show-level metadata & cast with characters...")
-    shows_query = """
-    WITH all_basics AS (
-        SELECT
-            tconst,
-            titleType,
-            primaryTitle,
-            originalTitle,
-            TRY_CAST(startYear AS INTEGER) AS start_year,
-            TRY_CAST(endYear AS INTEGER) AS end_year,
-            TRY_CAST(runtimeMinutes AS INTEGER) AS runtime_minutes,
-            genres
-        FROM read_csv('title.basics.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True)
-        WHERE titleType IN ('tvSeries', 'tvMiniSeries', 'tvEpisode')
-    ),
-    show_basics AS (
-        SELECT
-            tconst AS show_id,
-            primaryTitle AS title,
-            originalTitle AS original_title,
-            start_year,
-            end_year,
-            genres
-        FROM all_basics
-        WHERE titleType IN ('tvSeries', 'tvMiniSeries')
-    ),
-    episodes_raw AS (
-        SELECT
-            e.tconst AS episode_id,
-            e.parentTconst AS show_id,
-            COALESCE(TRY_CAST(e.seasonNumber AS INTEGER), 0) AS season_number
-        FROM read_csv('title.episode.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True) e
-        WHERE e.parentTconst IN (SELECT show_id FROM show_basics)
-    ),
-    show_episode_stats AS (
-        SELECT
-            e.show_id,
-            COUNT(DISTINCT NULLIF(e.season_number, 0)) AS total_seasons,
-            COUNT(e.episode_id) AS total_episodes,
-            SUM(b.runtime_minutes) AS total_time_taken_for_all_episodes
-        FROM episodes_raw e
-        LEFT JOIN all_basics b ON e.episode_id = b.tconst
-        GROUP BY e.show_id
-    ),
-    show_ratings AS (
-        SELECT
-            tconst AS show_id,
-            TRY_CAST(averageRating AS FLOAT) AS rating,
-            TRY_CAST(numVotes AS INTEGER) AS vote_count
-        FROM read_csv('title.ratings.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True)
-    ),
-    principals AS (
-        SELECT
-            p.tconst AS show_id,
-            TRY_CAST(p.ordering AS INTEGER) AS ordering,
-            p.nconst,
-            p.category,
-            p.job,
-            p.characters,
-            n.primaryName AS name
-        FROM read_csv('title.principals.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True) p
-        JOIN read_csv('name.basics.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True) n
-            ON p.nconst = n.nconst
-        WHERE p.tconst IN (SELECT show_id FROM show_basics)
-    ),
-    distinct_principals AS (
-        SELECT
-            show_id,
-            ordering,
-            nconst,
-            name,
-            category,
-            job,
-            characters,
-            ROW_NUMBER() OVER (
-                PARTITION BY show_id, category, nconst
-                ORDER BY ordering
-            ) AS dup_rank
-        FROM principals
-    ),
-    ranked_principals AS (
-        SELECT
-            show_id,
-            ordering,
-            nconst,
-            name,
-            category,
-            job,
-            CASE
-                WHEN characters IS NOT NULL AND characters != '' AND characters != '[]' THEN
-                    name || ' (as ' || replace(replace(replace(replace(characters, '["', ''), '"]', ''), '","', ', '), '", "', ', ') || ')'
-                ELSE name
-            END AS actor_display,
-            ROW_NUMBER() OVER (
-                PARTITION BY show_id, (category IN ('actor', 'actress'))
-                ORDER BY ordering
-            ) AS cast_rank
-        FROM distinct_principals
-        WHERE dup_rank = 1
-    ),
-    crew_agg AS (
-        SELECT
-            show_id,
-            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category = 'writer' OR LOWER(job) LIKE '%creator%') AS creators,
-            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category = 'writer' OR LOWER(job) LIKE '%creator%') AS creator_ids,
-            string_agg(actor_display, ', ' ORDER BY ordering) FILTER (WHERE category IN ('actor', 'actress') AND cast_rank <= 6) AS casts,
-            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category IN ('actor', 'actress') AND cast_rank <= 6) AS casts_id,
-            string_agg(name, ', ' ORDER BY ordering) FILTER (WHERE category NOT IN ('actor', 'actress')) AS crews,
-            string_agg(nconst, ', ' ORDER BY ordering) FILTER (WHERE category NOT IN ('actor', 'actress')) AS crews_id
-        FROM ranked_principals
-        GROUP BY show_id
-    )
-    SELECT
-        b.show_id,
-        b.title,
-        b.original_title,
-        b.start_year,
-        b.end_year,
-        s.total_seasons,
-        s.total_episodes,
-        s.total_time_taken_for_all_episodes,
-        r.rating,
-        r.vote_count,
-        b.genres,
-        c.creators,
-        c.creator_ids,
-        c.casts,
-        c.casts_id,
-        c.crews,
-        c.crews_id
-    FROM show_basics b
-    LEFT JOIN show_episode_stats s ON b.show_id = s.show_id
-    LEFT JOIN show_ratings r ON b.show_id = r.show_id
-    LEFT JOIN crew_agg c ON b.show_id = c.show_id
-    """
-    shows_data = conn_duck.execute(shows_query).fetchall()
-    print(f"Extracted {len(shows_data):,} TV shows.")
-
-    print(
-        "\nStep 2/2: Extracting season-level aggregations (including Season 0 Specials)..."
-    )
-    seasons_query = """
-    WITH show_ids AS (
-        SELECT tconst AS show_id
-        FROM read_csv('title.basics.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True)
-        WHERE titleType IN ('tvSeries', 'tvMiniSeries')
-    ),
-    episodes AS (
-        SELECT
-            e.tconst AS episode_id,
-            e.parentTconst AS show_id,
-            COALESCE(TRY_CAST(e.seasonNumber AS INTEGER), 0) AS season_number
-        FROM read_csv('title.episode.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True) e
-        WHERE e.parentTconst IN (SELECT show_id FROM show_ids)
-    ),
-    ratings AS (
-        SELECT
-            tconst AS episode_id,
-            TRY_CAST(averageRating AS FLOAT) AS rating,
-            TRY_CAST(numVotes AS INTEGER) AS vote_count
-        FROM read_csv('title.ratings.tsv.gz', delim='\t', nullstr='\\N', quote='', header=True, all_varchar=True)
-    )
-    SELECT
-        e.show_id,
-        e.season_number,
-        COUNT(e.episode_id) AS season_total_episodes,
-        ROUND(AVG(r.rating), 2) AS season_rating,
-        SUM(r.vote_count) AS season_vote_count
-    FROM episodes e
-    LEFT JOIN ratings r ON e.episode_id = r.episode_id
-    GROUP BY e.show_id, e.season_number
-    ORDER BY e.show_id, e.season_number
-    """
-    seasons_data = conn_duck.execute(seasons_query).fetchall()
-    print(f"Extracted {len(seasons_data):,} season records.")
-
-    print("\nWriting records into SQLite database (shows.db)...")
-    if os.path.exists("shows.db"):
-        os.remove("shows.db")
-
-    conn_sqlite = sqlite3.connect("shows.db")
-    cursor = conn_sqlite.cursor()
-
-    cursor.execute(
+# ==========================================
+# SCRAPER LOGIC
+# ==========================================
+def init_db():
+    conn = duckdb.connect(DB_FILE)
+    conn.execute(
         """
-        CREATE TABLE shows (
-            show_id TEXT PRIMARY KEY,
-            title TEXT,
-            original_title TEXT,
+        CREATE TABLE IF NOT EXISTS shows (
+            tmdb_id BIGINT PRIMARY KEY,
+            imdb_id VARCHAR,
+            title VARCHAR,
+            original_title VARCHAR,
+            backdrop_path VARCHAR,
+            poster_path VARCHAR,
             start_year INTEGER,
             end_year INTEGER,
-            total_seasons INTEGER,
-            total_episodes INTEGER,
-            total_time_taken_for_all_episodes INTEGER,
-            rating REAL,
-            vote_count INTEGER,
-            genres TEXT,
-            creators TEXT,
-            creator_ids TEXT,
-            casts TEXT,
-            casts_id TEXT,
-            crews TEXT,
-            crews_id TEXT
-        )
-    """
-    )
+            status VARCHAR,
+            genres VARCHAR,
+            description VARCHAR,
+            showrunner_and_creator VARCHAR,
+            showrunner_and_creator_id VARCHAR,
+            showrunner_and_creator_image VARCHAR,
+            casts VARCHAR,
+            casts_id VARCHAR,
+            casts_image VARCHAR,
+            crews VARCHAR,
+            crews_id VARCHAR,
+            crews_image VARCHAR,
+            original_network VARCHAR,
+            original_network_id VARCHAR,
+            original_network_image VARCHAR,
+            prod_studio VARCHAR,
+            prod_studio_id VARCHAR,
+            prod_studio_image VARCHAR,
+            total_seasons INTEGER
+        );
 
-    cursor.execute(
-        """
-        CREATE TABLE seasons (
-            show_id TEXT,
+        CREATE TABLE IF NOT EXISTS seasons (
+            show_tmdb_id BIGINT,
+            show_imdb_id VARCHAR,
             season_number INTEGER,
-            season_total_episodes INTEGER,
-            season_rating REAL,
-            season_vote_count INTEGER,
-            PRIMARY KEY (show_id, season_number),
-            FOREIGN KEY (show_id) REFERENCES shows (show_id)
-        )
+            season_name VARCHAR,
+            air_year INTEGER,
+            poster_path VARCHAR,
+            tmdb_episode_count INTEGER,
+            PRIMARY KEY (show_tmdb_id, season_number)
+        );
     """
     )
+    conn.close()
 
-    cursor.executemany(
-        "INSERT INTO shows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        shows_data,
+
+async def download_tmdb_tv_dump(session):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    candidate_dates = [
+        now.strftime("%m_%d_%Y"),
+        (now - datetime.timedelta(days=1)).strftime("%m_%d_%Y"),
+    ]
+
+    dump_filename = f"tv_series_ids_{SHARD_INDEX}.json.gz"
+    downloaded = False
+
+    for date_str in candidate_dates:
+        url = f"http://files.tmdb.org/p/exports/tv_series_ids_{date_str}.json.gz"
+        print(f"[*] [Shard {SHARD_INDEX}] Checking dump: {url}", flush=True)
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                with open(dump_filename, "wb") as f:
+                    f.write(await resp.read())
+                print(
+                    f"[+] [Shard {SHARD_INDEX}] Downloaded TV dump for {date_str}",
+                    flush=True,
+                )
+                downloaded = True
+                break
+
+    if not downloaded:
+        raise RuntimeError("Failed to download any valid TMDB daily TV dump.")
+
+    query = f"SELECT id FROM read_json('{dump_filename}') WHERE adult = false"
+    rows = duckdb.sql(query).fetchall()
+    all_tv_ids = [r[0] for r in rows]
+
+    if os.path.exists(dump_filename):
+        os.remove(dump_filename)
+
+    tv_ids = [
+        t_id for idx, t_id in enumerate(all_tv_ids) if idx % SHARD_TOTAL == SHARD_INDEX
+    ]
+
+    print(
+        f"[*] Total non-adult shows: {len(all_tv_ids):,} | Assigned to Shard {SHARD_INDEX}/{SHARD_TOTAL}: {len(tv_ids):,}",
+        flush=True,
     )
-    cursor.executemany("INSERT INTO seasons VALUES (?, ?, ?, ?, ?)", seasons_data)
+    return tv_ids
 
-    print("Creating indexes...")
-    cursor.execute("CREATE INDEX idx_shows_title ON shows(title)")
-    cursor.execute("CREATE INDEX idx_shows_original_title ON shows(original_title)")
-    cursor.execute("CREATE INDEX idx_shows_start_year ON shows(start_year)")
-    cursor.execute("CREATE INDEX idx_shows_rating ON shows(rating)")
-    cursor.execute("CREATE INDEX idx_seasons_show_id ON seasons(show_id)")
 
-    conn_sqlite.commit()
-    conn_sqlite.close()
-    conn_duck.close()
+async def fetch_show(session, semaphore, show_id, retries=5):
+    url = f"https://api.themoviedb.org/3/tv/{show_id}?append_to_response=credits,external_ids"
 
-    print("\nFinished! Database ready at shows.db")
+    for attempt in range(retries):
+        await pause_event.wait()
+
+        async with semaphore:
+            try:
+                async with session.get(url, headers=HEADERS) as resp:
+                    if resp.status == 200:
+                        data = orjson.loads(await resp.read())
+
+                        imdb_id = data.get("external_ids", {}).get("imdb_id")
+                        if not imdb_id or not str(imdb_id).strip():
+                            return "NO_IMDB", None, [], data.get("name"), None
+
+                        credits = data.get("credits", {})
+                        cast_list = credits.get("cast", [])
+                        crew_list = credits.get("crew", [])
+                        created_by = data.get("created_by", [])
+                        networks = data.get("networks", [])
+                        prod_list = data.get("production_companies", [])
+
+                        first_air = data.get("first_air_date") or ""
+                        last_air = data.get("last_air_date") or ""
+                        start_year = (
+                            int(first_air[:4])
+                            if len(first_air) >= 4 and first_air[:4].isdigit()
+                            else None
+                        )
+                        end_year = (
+                            int(last_air[:4])
+                            if len(last_air) >= 4 and last_air[:4].isdigit()
+                            else None
+                        )
+
+                        show_record = (
+                            data.get("id"),
+                            imdb_id.strip(),
+                            data.get("name"),
+                            data.get("original_name"),
+                            data.get("backdrop_path"),
+                            data.get("poster_path"),
+                            start_year,
+                            end_year,
+                            data.get("status"),
+                            orjson.dumps(
+                                [
+                                    g.get("name")
+                                    for g in data.get("genres", [])
+                                    if g.get("name")
+                                ]
+                            ).decode("utf-8"),
+                            data.get("overview"),
+                            orjson.dumps([c.get("name") for c in created_by]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([c.get("id") for c in created_by]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps(
+                                [c.get("profile_path") for c in created_by]
+                            ).decode("utf-8"),
+                            orjson.dumps([c.get("name") for c in cast_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([c.get("id") for c in cast_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps(
+                                [c.get("profile_path") for c in cast_list]
+                            ).decode("utf-8"),
+                            orjson.dumps([c.get("name") for c in crew_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([c.get("id") for c in crew_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps(
+                                [c.get("profile_path") for c in crew_list]
+                            ).decode("utf-8"),
+                            orjson.dumps([n.get("name") for n in networks]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([n.get("id") for n in networks]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([n.get("logo_path") for n in networks]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([p.get("name") for p in prod_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps([p.get("id") for p in prod_list]).decode(
+                                "utf-8"
+                            ),
+                            orjson.dumps(
+                                [p.get("logo_path") for p in prod_list]
+                            ).decode("utf-8"),
+                            data.get("number_of_seasons"),
+                        )
+
+                        seasons_records = []
+                        for s in data.get("seasons", []):
+                            s_air = s.get("air_date") or ""
+                            s_year = (
+                                int(s_air[:4])
+                                if len(s_air) >= 4 and s_air[:4].isdigit()
+                                else None
+                            )
+                            seasons_records.append(
+                                (
+                                    data.get("id"),
+                                    imdb_id.strip(),
+                                    s.get("season_number"),
+                                    s.get("name"),
+                                    s_year,
+                                    s.get("poster_path"),
+                                    s.get("episode_count"),
+                                )
+                            )
+
+                        return (
+                            "OK",
+                            show_record,
+                            seasons_records,
+                            data.get("name"),
+                            start_year,
+                        )
+
+                    elif resp.status == 404:
+                        return "404", None, [], None, None
+
+                    elif resp.status == 429:
+                        retry_after = float(resp.headers.get("Retry-After", 2.0))
+                        async with pause_lock:
+                            if pause_event.is_set():
+                                pause_event.clear()
+                                print(
+                                    f"\n[429] Rate limit hit. Pausing all workers for {retry_after:.1f}s:",
+                                    flush=True,
+                                )
+                                remaining = retry_after
+                                while remaining > 0:
+                                    print(
+                                        f"  [429] {remaining:.1f}s remaining...",
+                                        flush=True,
+                                    )
+                                    step = min(1.0, remaining)
+                                    await asyncio.sleep(step)
+                                    remaining -= step
+                                print("  [429] Resuming workers.\n", flush=True)
+                                pause_event.set()
+
+                        await pause_event.wait()
+                        continue
+
+                    else:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                await asyncio.sleep(0.5 * (attempt + 1))
+
+    return "ERR", None, [], None, None
+
+
+async def writer_worker(queue):
+    conn = duckdb.connect(DB_FILE)
+    shows_batch = []
+    seasons_batch = []
+
+    while True:
+        item = await queue.get()
+        if item is None:
+            break
+        show_rec, seasons_recs = item
+        shows_batch.append(show_rec)
+        seasons_batch.extend(seasons_recs)
+
+        if len(shows_batch) >= 200:
+            conn.executemany(
+                "INSERT OR REPLACE INTO shows VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                shows_batch,
+            )
+            if seasons_batch:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO seasons VALUES (?,?,?,?,?,?,?)",
+                    seasons_batch,
+                )
+            shows_batch.clear()
+            seasons_batch.clear()
+
+    if shows_batch:
+        conn.executemany(
+            "INSERT OR REPLACE INTO shows VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            shows_batch,
+        )
+    if seasons_batch:
+        conn.executemany(
+            "INSERT OR REPLACE INTO seasons VALUES (?,?,?,?,?,?,?)",
+            seasons_batch,
+        )
+    conn.close()
+
+
+async def export_csv():
+    print(f"[*] Exporting Shard {SHARD_INDEX} to CSV...", flush=True)
+    conn = duckdb.connect(DB_FILE)
+    conn.execute(
+        f"COPY shows TO '{SHOWS_CSV}' (HEADER, DELIMITER ',', COMPRESSION 'gzip');"
+    )
+    conn.execute(
+        f"COPY seasons TO '{SEASONS_CSV}' (HEADER, DELIMITER ',', COMPRESSION 'gzip');"
+    )
+    conn.close()
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+    print(f"[+] Shard {SHARD_INDEX} export complete.", flush=True)
+
+
+async def run_scraper():
+    init_db()
+
+    timeout = aiohttp.ClientTimeout(total=25)
+    connector = aiohttp.TCPConnector(limit=CONCURRENCY, keepalive_timeout=60)
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    queue = asyncio.Queue(maxsize=1500)
+
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        tv_ids = await download_tmdb_tv_dump(session)
+        writer_task = asyncio.create_task(writer_worker(queue))
+
+        processed = 0
+        success_count = 0
+        no_imdb_count = 0
+        not_found_count = 0
+        total = len(tv_ids)
+        start_time = time.time()
+
+        async def worker(t_id):
+            nonlocal processed, success_count, no_imdb_count, not_found_count
+            status, show_rec, seasons_recs, title, year = await fetch_show(
+                session, semaphore, t_id
+            )
+
+            if status == "OK":
+                success_count += 1
+                await queue.put((show_rec, seasons_recs))
+            elif status == "NO_IMDB":
+                no_imdb_count += 1
+            elif status == "404":
+                not_found_count += 1
+
+            processed += 1
+
+            if processed % 50 == 0 or processed == total:
+                elapsed = max(1, time.time() - start_time)
+                speed = processed / elapsed
+                pct = (processed / total) * 100
+                display_title = (
+                    (title[:25] + "...")
+                    if title and len(title) > 25
+                    else (title or "N/A")
+                )
+                print(
+                    f"[Shard {SHARD_INDEX}/{SHARD_TOTAL}] {processed:,}/{total:,} ({pct:5.1f}%) | "
+                    f"{speed:4.1f} req/s | OK: {success_count:,} | Ignored (No IMDb): {no_imdb_count:,} | "
+                    f"404: {not_found_count} | '{display_title}' ({year or '?'})",
+                    flush=True,
+                )
+
+        await asyncio.gather(*(worker(t_id) for t_id in tv_ids))
+        await queue.put(None)
+        await writer_task
+
+    await export_csv()
+    print(f"[*] Shard {SHARD_INDEX} completed successfully.", flush=True)
+
+
+# ==========================================
+# MERGE LOGIC
+# ==========================================
+def run_merge():
+    files = {
+        "title.ratings.tsv.gz": "https://datasets.imdbws.com/title.ratings.tsv.gz",
+        "title.episode.tsv.gz": "https://datasets.imdbws.com/title.episode.tsv.gz",
+        "title.basics.tsv.gz": "https://datasets.imdbws.com/title.basics.tsv.gz",
+    }
+
+    print("[*] Checking IMDb dumps...", flush=True)
+    for filename, url in files.items():
+        if not os.path.exists(filename):
+            print(f"[*] Downloading {filename}...", flush=True)
+            urllib.request.urlretrieve(url, filename)
+            print(f"[+] Downloaded {filename}.", flush=True)
+
+    print("[*] Enriching Shows and Seasons with IMDb metrics...", flush=True)
+    conn = duckdb.connect()
+    query = """
+        CREATE OR REPLACE VIEW ep_stats AS
+        SELECT
+            e.parentTconst,
+            COUNT(e.tconst) AS total_episodes,
+            SUM(TRY_CAST(b.runtimeMinutes AS INTEGER)) AS total_time_taken_minutes
+        FROM read_csv('title.episode.tsv.gz', delim='\\t', nullstr='\\\\N') e
+        LEFT JOIN read_csv('title.basics.tsv.gz', delim='\\t', nullstr='\\\\N') b ON e.tconst = b.tconst
+        GROUP BY e.parentTconst;
+
+        CREATE OR REPLACE VIEW season_ratings AS
+        SELECT
+            e.parentTconst,
+            TRY_CAST(e.seasonNumber AS INTEGER) AS seasonNumber,
+            ROUND(AVG(r.averageRating), 2) AS season_imdb_rating,
+            SUM(r.numVotes) AS season_imdb_votes,
+            COUNT(e.tconst) AS season_imdb_episodes
+        FROM read_csv('title.episode.tsv.gz', delim='\\t', nullstr='\\\\N') e
+        LEFT JOIN read_csv('title.ratings.tsv.gz', delim='\\t', nullstr='\\\\N') r ON e.tconst = r.tconst
+        GROUP BY e.parentTconst, e.seasonNumber;
+
+        COPY (
+            SELECT
+                s.*,
+                r.averageRating AS imdb_rating,
+                r.numVotes AS imdb_votes,
+                ep.total_episodes AS imdb_total_episodes,
+                ep.total_time_taken_minutes AS imdb_total_time_taken_minutes
+            FROM read_csv_auto('show_shards/shows_shard_*.csv.gz') s
+            LEFT JOIN read_csv('title.ratings.tsv.gz', delim='\\t', nullstr='\\\\N') r ON s.imdb_id = r.tconst
+            LEFT JOIN ep_stats ep ON s.imdb_id = ep.parentTconst
+        ) TO 'shows.csv.gz' (HEADER, COMPRESSION 'gzip');
+
+        COPY (
+            SELECT
+                sn.*,
+                sr.season_imdb_rating,
+                sr.season_imdb_votes,
+                sr.season_imdb_episodes
+            FROM read_csv_auto('show_shards/seasons_shard_*.csv.gz') sn
+            LEFT JOIN season_ratings sr ON sn.show_imdb_id = sr.parentTconst AND sn.season_number = sr.seasonNumber
+        ) TO 'seasons.csv.gz' (HEADER, COMPRESSION 'gzip');
+    """
+    conn.execute(query)
+    conn.close()
+    print("[+] Successfully generated shows.csv.gz and seasons.csv.gz!", flush=True)
 
 
 if __name__ == "__main__":
-    build_shows_database()
+    if len(sys.argv) > 1 and sys.argv[1] == "merge":
+        run_merge()
+    else:
+        asyncio.run(run_scraper())
