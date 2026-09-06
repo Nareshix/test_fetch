@@ -1,0 +1,206 @@
+name: Daily Media Sync & Release
+
+on:
+  schedule:
+    - cron: '0 9 * * *' # Daily at 09:00 UTC
+  workflow_dispatch:
+    inputs:
+      force_full:
+        description: 'Force full re-scrape from scratch?'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-mode:
+    runs-on: ubuntu-latest
+    outputs:
+      has_release: ${{ steps.check.outputs.has_release }}
+    steps:
+      - name: Check for latest release
+        id: check
+        run: |
+          if [ "${{ inputs.force_full }}" = "true" ]; then
+            echo "has_release=false" >> $GITHUB_OUTPUT
+          elif gh release view --repo ${{ github.repository }} >/dev/null 2>&1; then
+            echo "has_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_release=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ====================================================
+  # PATH A: INCREMENTAL UPDATE (~3 MINS)
+  # ====================================================
+  incremental-sync:
+    needs: check-mode
+    if: needs.check-mode.outputs.has_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - run: pip install -r requirements.txt
+
+      - name: Download Previous Master Dataset
+        run: |
+          echo "[*] Downloading latest master release..."
+          gh release download --pattern "*.csv.gz" --dir .
+          mv movies.csv.gz movies_master.csv.gz
+          mv shows.csv.gz shows_master.csv.gz
+          mv seasons.csv.gz seasons_master.csv.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Incremental Updates (TMDb Changes)
+        env:
+          TMDB_API_KEY_MOVIES: ${{ secrets.TMDB_API_KEY_MOVIES }}
+          TMDB_API_KEY_SHOWS: ${{ secrets.TMDB_API_KEY_SHOWS }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python -u movies.py incremental
+          python -u shows.py incremental
+
+      - name: Refresh All IMDb Ratings
+        run: |
+          python -u movies.py merge movies_master.csv.gz
+          python -u shows.py merge shows_master.csv.gz seasons_master.csv.gz
+
+      - name: Build Anime Dataset
+        run: python -u anime.py
+
+      - name: Build Master SQLite DB with FTS5 Search
+        run: python -u build_master_db.py
+
+      - name: Compress Database
+        run: gzip -9 -c media.sqlite > media.sqlite.gz
+
+      - name: Get current date tag
+        id: date
+        run: echo "tag=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: media-master-${{ steps.date.outputs.tag }}
+          name: "Master Media Dataset (${{ steps.date.outputs.tag }})"
+          draft: false
+          prerelease: false
+          files: |
+            movies.csv.gz
+            shows.csv.gz
+            seasons.csv.gz
+            media.sqlite.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ====================================================
+  # PATH B: FULL RE-SCRAPE FROM SCRATCH
+  # ====================================================
+  full-scrape-movies:
+    needs: check-mode
+    if: needs.check-mode.outputs.has_release == 'false'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - name: Run Full Movie Scraper
+        env:
+          TMDB_API_KEY_MOVIES: ${{ secrets.TMDB_API_KEY_MOVIES }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_TOTAL: 4
+          PYTHONUNBUFFERED: "1"
+        run: python -u movies.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: movies-shard-${{ matrix.shard }}
+          path: movies_shard_${{ matrix.shard }}.csv.gz
+          retention-days: 1
+
+  full-scrape-shows:
+    needs: check-mode
+    if: needs.check-mode.outputs.has_release == 'false'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - name: Run Full Shows Scraper
+        env:
+          TMDB_API_KEY_SHOWS: ${{ secrets.TMDB_API_KEY_SHOWS }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_TOTAL: 4
+          PYTHONUNBUFFERED: "1"
+        run: python -u shows.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shows-shard-${{ matrix.shard }}
+          path: |
+            shows_shard_${{ matrix.shard }}.csv.gz
+            seasons_shard_${{ matrix.shard }}.csv.gz
+          retention-days: 1
+
+  merge-full:
+    needs: [check-mode, full-scrape-movies, full-scrape-shows]
+    if: needs.check-mode.outputs.has_release == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          path: shards
+          merge-multiple: true
+      - name: Organize Shards and Merge
+        run: |
+          mkdir -p movie_shards show_shards
+          mv shards/movies_shard_*.csv.gz movie_shards/
+          mv shards/shows_shard_*.csv.gz show_shards/
+          mv shards/seasons_shard_*.csv.gz show_shards/
+          python -u movies.py merge
+          python -u shows.py merge
+          python -u anime.py
+          python -u build_master_db.py
+          gzip -9 -c media.sqlite > media.sqlite.gz
+
+      - name: Get current date tag
+        id: date
+        run: echo "tag=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: media-master-${{ steps.date.outputs.tag }}
+          name: "Master Media Dataset (${{ steps.date.outputs.tag }})"
+          draft: false
+          prerelease: false
+          files: |
+            movies.csv.gz
+            shows.csv.gz
+            seasons.csv.gz
+            media.sqlite.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
