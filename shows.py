@@ -443,7 +443,16 @@ def run_merge():
             COUNT(e.tconst) AS season_imdb_episodes
         FROM read_csv('title.episode.tsv.gz', delim='\\t', nullstr='\\\\N') e
         LEFT JOIN read_csv('title.ratings.tsv.gz', delim='\\t', nullstr='\\\\N') r ON e.tconst = r.tconst
-        GROUP BY e.parentTconst, e.seasonNumber;
+        GROUP BY CREATE OR REPLACE VIEW season_ratings AS
+        SELECT
+            e.parentTconst,
+            COALESCE(TRY_CAST(e.seasonNumber AS INTEGER), 0) AS seasonNumber,
+            ROUND(AVG(r.averageRating), 2) AS season_imdb_rating,
+            SUM(r.numVotes) AS season_imdb_votes,
+            COUNT(e.tconst) AS season_imdb_episodes
+        FROM read_csv('title.episode.tsv.gz', delim='\\t', nullstr='\\\\N') e
+        LEFT JOIN read_csv('title.ratings.tsv.gz', delim='\\t', nullstr='\\\\N') r ON e.tconst = r.tconst
+        GROUP BY e.parentTconst, seasonNumber;e.parentTconst, e.seasonNumber;
 
         COPY (
             SELECT
