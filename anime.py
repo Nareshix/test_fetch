@@ -13,7 +13,6 @@ import requests
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 FRIBB_JSON_PATH = os.path.join(DATA_DIR, "anime-list-mini.json")
-CSV_PATH = os.path.join(DATA_DIR, "anilist_anime_data_complete.csv")
 DB_PATH = "anime.db"
 
 csv.field_size_limit(2147483647)
@@ -207,8 +206,58 @@ def extract_part_label(title):
     return None
 
 
+def execute_burst_request(payload, headers):
+    """Executes requests at maximum speed with zero artificial delays.
+
+    Pauses strictly when AniList returns HTTP 429 using Retry-After.
+    """
+    while True:
+        try:
+            r = requests.post(ANILIST_API, json=payload, headers=headers, timeout=30)
+
+            if r.status_code == 200:
+                data = r.json()
+                if "errors" in data:
+                    print(
+                        f"\n  [!] GraphQL error: {data['errors']}. Retrying in 5s...",
+                        flush=True,
+                    )
+                    time.sleep(5)
+                    continue
+                return data
+
+            elif r.status_code == 429:
+                retry_after = int(r.headers.get("Retry-After", 60))
+                print(
+                    f"\n  [429] Rate limit hit. Pausing for {retry_after}s...",
+                    flush=True,
+                )
+                time.sleep(retry_after + 1)
+                continue
+
+            elif r.status_code in (500, 502, 503, 504):
+                print(
+                    f"\n  [!] Server error {r.status_code}. Retrying in 5s...",
+                    flush=True,
+                )
+                time.sleep(5)
+                continue
+
+            else:
+                print(
+                    f"\n  [!] HTTP {r.status_code}: {r.text[:120]}. Retrying in 5s...",
+                    flush=True,
+                )
+                time.sleep(5)
+                continue
+
+        except Exception as e:
+            print(f"\n  [!] Network exception: {e}. Retrying in 3s...", flush=True)
+            time.sleep(3)
+
+
 def fetch_all_from_anilist_api():
-    print("[*] Querying AniList GraphQL API (5,000 pagination bypass)...", flush=True)
+    print("[*] Burst-fetching complete AniList catalog...", flush=True)
     year_ranges = [
         (1940, 1965),
         (1966, 1970),
@@ -231,7 +280,12 @@ def fetch_all_from_anilist_api():
     media_store = {}
     raw_recs_map = {}
     summary_ids = set()
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "MediaDatabaseSync/1.0",
+    }
 
     def process_media_list(media_list):
         for m in media_list:
@@ -251,7 +305,7 @@ def fetch_all_from_anilist_api():
             relations = m.get("relations", {}).get("edges", [])
             for r in relations:
                 if r.get("relationType") in ("SUMMARY", "COMPILATION"):
-                    t_id = r.get("node", {}).get("id")
+                    t_id = (r.get("node") or {}).get("id")
                     if t_id:
                         summary_ids.add(int(t_id))
 
@@ -304,6 +358,7 @@ def fetch_all_from_anilist_api():
                 "relations": relations,
             }
 
+    # 1. Year Ranges Pass
     for start_year, end_year in year_ranges:
         start_date = convert_to_fuzzy_date(start_year - 1, 12, 31)
         end_date = convert_to_fuzzy_date(end_year + 1, 1, 1)
@@ -318,169 +373,43 @@ def fetch_all_from_anilist_api():
                 "endDate": end_date,
             }
             payload = {"query": ANILIST_QUERY, "variables": variables}
-            resp = None
 
-            for attempt in range(5):
-                try:
-                    r = requests.post(
-                        ANILIST_API, json=payload, headers=headers, timeout=30
-                    )
-                    if r.status_code == 200:
-                        resp = r.json()
-                        break
-                    elif r.status_code == 429:
-                        retry_after = int(r.headers.get("Retry-After", 60))
-                        time.sleep(retry_after)
-                    else:
-                        time.sleep(2)
-                except Exception:
-                    time.sleep(2)
-
-            if not resp or "data" not in resp:
-                break
-
+            resp = execute_burst_request(payload, headers)
             page_data = resp["data"]["Page"]
             process_media_list(page_data.get("media", []))
             page_info = page_data.get("pageInfo", {})
             has_next_page = page_info.get("hasNextPage", False)
             page += 1
-            time.sleep(0.6)
 
         print(
-            f"[*] Fetched {start_year}-{end_year} | Total: {len(media_store):,}",
+            f"[*] Completed {start_year}-{end_year} | Current Total: {len(media_store):,}",
             flush=True,
         )
 
-    # TBA Pass
+    # 2. TBA / Undated Pass
+    print("[*] Fetching TBA and undated anime...", flush=True)
     page = 1
     has_next_page = True
     while has_next_page:
         variables = {"page": page, "perPage": 50, "status": "NOT_YET_RELEASED"}
         payload = {"query": ANILIST_QUERY, "variables": variables}
-        resp = None
-        for attempt in range(5):
-            try:
-                r = requests.post(
-                    ANILIST_API, json=payload, headers=headers, timeout=30
-                )
-                if r.status_code == 200:
-                    resp = r.json()
-                    break
-                elif r.status_code == 429:
-                    time.sleep(int(r.headers.get("Retry-After", 60)))
-                else:
-                    time.sleep(2)
-            except Exception:
-                time.sleep(2)
 
-        if not resp or "data" not in resp:
-            break
-
+        resp = execute_burst_request(payload, headers)
         page_data = resp["data"]["Page"]
         process_media_list(page_data.get("media", []))
-        has_next_page = page_data.get("pageInfo", {}).get("hasNextPage", False)
+        page_info = page_data.get("pageInfo", {})
+        has_next_page = page_info.get("hasNextPage", False)
         page += 1
-        time.sleep(0.6)
 
+    print(f"[+] Total AniList titles fetched: {len(media_store):,}", flush=True)
     return media_store, raw_recs_map, summary_ids
 
 
 def run_anime_pipeline():
     download_prerequisites()
 
-    if os.path.exists(CSV_PATH):
-        print(f"[*] Reading existing AniList dataset from {CSV_PATH}...", flush=True)
-        media_store = {}
-        raw_recs_map = {}
-        summary_ids = set()
-
-        with open(CSV_PATH, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    a_id = int(row["id"])
-                except Exception:
-                    continue
-
-                fmt = (row.get("format") or "TV").upper()
-                if fmt in EXCLUDED_FORMATS:
-                    continue
-
-                try:
-                    relations = json.loads(row.get("relations") or "[]")
-                except Exception:
-                    relations = []
-
-                try:
-                    recs_list = json.loads(row.get("recommendations") or "[]")
-                    parsed_recs = []
-                    for item in recs_list:
-                        node = item.get("node") or {}
-                        rating = node.get("rating") or 0
-                        if rating > 0 and node.get("mediaRecommendation", {}).get("id"):
-                            parsed_recs.append(
-                                (rating, int(node["mediaRecommendation"]["id"]))
-                            )
-                    parsed_recs.sort(key=lambda x: x[0], reverse=True)
-                    raw_recs_map[a_id] = [r_id for _, r_id in parsed_recs]
-                except Exception:
-                    raw_recs_map[a_id] = []
-
-                studio = extract_studio(json.loads(row.get("studios") or "[]"))
-                director, director_image = extract_director_and_image(
-                    json.loads(row.get("staff") or "[]")
-                )
-
-                y = row.get("startDate_year")
-                m = row.get("startDate_month")
-                d = row.get("startDate_day")
-                start_date = (
-                    f"{int(float(y)):04d}-{int(float(m)) if m and m != 'nan' else 1:02d}-{int(float(d)) if d and d != 'nan' else 1:02d}"
-                    if y and y != "nan"
-                    else None
-                )
-
-                score_val = row.get("averageScore")
-                rating = (
-                    round(float(score_val) / 10.0, 1)
-                    if score_val and score_val != "nan"
-                    else None
-                )
-                ep_val = row.get("episodes")
-                episodes = int(float(ep_val)) if ep_val and ep_val != "nan" else None
-                pop_val = row.get("popularity")
-                popularity = int(float(pop_val)) if pop_val and pop_val != "nan" else 0
-
-                is_adult_str = str(row.get("isAdult") or "").strip().lower()
-                is_adult = 1 if is_adult_str in ("true", "1") else 0
-
-                media_store[a_id] = {
-                    "id": a_id,
-                    "title_english": row.get("title_english")
-                    if row.get("title_english") != "nan"
-                    else None,
-                    "title_romaji": row.get("title_romaji") or "Unknown",
-                    "format": fmt,
-                    "episodes": episodes,
-                    "status": row.get("status"),
-                    "rating": rating,
-                    "popularity": popularity,
-                    "genres": clean_genres_to_string(row.get("genres")),
-                    "is_adult": is_adult,
-                    "description": row.get("description"),
-                    "banner_url": row.get("bannerImage")
-                    if row.get("bannerImage") != "nan"
-                    else None,
-                    "cover_url": row.get("coverImage_extraLarge")
-                    or row.get("coverImage_large"),
-                    "studio": studio,
-                    "director": director,
-                    "director_image": director_image,
-                    "start_date": start_date,
-                    "relations": relations,
-                }
-    else:
-        media_store, raw_recs_map, summary_ids = fetch_all_from_anilist_api()
+    # Always fetch fresh dataset directly from API
+    media_store, raw_recs_map, summary_ids = fetch_all_from_anilist_api()
 
     print("[*] Loading Fribb mapping...", flush=True)
     with open(FRIBB_JSON_PATH, "r", encoding="utf-8") as f:
