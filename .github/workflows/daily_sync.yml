@@ -77,6 +77,8 @@ jobs:
 
       - name: Build Master SQLite DB with FTS5 Search
         run: python -u build_master_db.py
+      - name: Normalize Cast & Crew Tables
+        run: python -u people.py
 
       - name: Compress Master Database
         run: gzip -9 -c media.sqlite > media.sqlite.gz
