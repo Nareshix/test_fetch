@@ -24,6 +24,9 @@ def normalize_people():
     cur.execute("PRAGMA journal_mode = MEMORY;")
     cur.execute("PRAGMA cache_size = -64000;")  # 64MB memory cache
 
+    cur.execute("DROP TABLE IF EXISTS media_credits;")
+    cur.execute("DROP TABLE IF EXISTS people;")
+
     # 1. Create normalized tables
     cur.execute("""
         CREATE TABLE IF NOT EXISTS people (
@@ -224,7 +227,7 @@ def normalize_people():
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_credits_person ON media_credits(person_id);"
     )
-    
+
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='search_index';")
     if cur.fetchone():
         print("[*] Indexing people into Unified FTS5 Search Index...", flush=True)
