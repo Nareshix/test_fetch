@@ -187,6 +187,7 @@ jobs:
           python -u shows.py merge
           python -u anime.py
           python -u build_master_db.py
+          python -u people.py
           gzip -9 -c media.sqlite > media.sqlite.gz
 
       - name: Get current date tag
