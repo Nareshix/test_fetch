@@ -224,6 +224,26 @@ def normalize_people():
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_credits_person ON media_credits(person_id);"
     )
+    
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='search_index';")
+    if cur.fetchone():
+        print("[*] Indexing people into Unified FTS5 Search Index...", flush=True)
+        # Delete any existing person records in FTS5 to prevent duplicates during incremental runs
+        cur.execute("DELETE FROM search_index WHERE media_type = 'person';")
+        cur.execute("""
+            INSERT INTO search_index (title, original_title, casts, media_type, item_id, year, poster_path, rating)
+            SELECT
+                name AS title,
+                NULL AS original_title,
+                NULL AS casts,
+                'person' AS media_type,
+                CAST(id AS TEXT) AS item_id,
+                NULL AS year,
+                image_path AS poster_path,
+                NULL AS rating
+            FROM people;
+        """)
+
 
     conn.commit()
     conn.close()
