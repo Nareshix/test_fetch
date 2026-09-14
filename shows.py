@@ -416,7 +416,6 @@ async def get_changed_tv_ids(session, start_date, end_date):
     print(f"[+] Found {len(changed_ids):,} modified/new TV IDs.", flush=True)
     return list(changed_ids)
 
-
 async def run_incremental(since_date):
     today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     delta_db = "shows_delta.duckdb"
@@ -480,14 +479,49 @@ async def run_incremental(since_date):
 
         ATTACH 'shows_delta.duckdb' AS delta_db;
 
-        DELETE FROM master_shows WHERE tmdb_id IN (SELECT tmdb_id FROM delta_db.shows);
-        INSERT INTO master_shows SELECT * FROM delta_db.shows;
+        DELETE FROM master_shows
+        WHERE tmdb_id IN (SELECT tmdb_id FROM delta_db.shows)
+           OR imdb_id IN (SELECT imdb_id FROM delta_db.shows WHERE imdb_id IS NOT NULL);
 
-        DELETE FROM master_seasons WHERE show_tmdb_id IN (SELECT show_tmdb_id FROM delta_db.seasons);
-        INSERT INTO master_seasons SELECT * FROM delta_db.seasons;
+        INSERT INTO master_shows
+        SELECT *
+        FROM delta_db.shows
+        WHERE imdb_id IS NOT NULL AND TRIM(imdb_id) != ''
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY imdb_id
+            ORDER BY CASE WHEN poster_path IS NOT NULL THEN 1 ELSE 0 END DESC, tmdb_id DESC
+        ) = 1;
 
-        COPY master_shows TO 'shows_master.csv.gz' (HEADER, DELIMITER ',', COMPRESSION 'gzip');
-        COPY master_seasons TO 'seasons_master.csv.gz' (HEADER, DELIMITER ',', COMPRESSION 'gzip');
+        DELETE FROM master_seasons
+        WHERE show_tmdb_id IN (SELECT show_tmdb_id FROM delta_db.seasons)
+           OR show_imdb_id IN (SELECT show_imdb_id FROM delta_db.seasons WHERE show_imdb_id IS NOT NULL);
+
+        INSERT INTO master_seasons
+        SELECT *
+        FROM delta_db.seasons
+        WHERE show_imdb_id IS NOT NULL AND season_number IS NOT NULL
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY show_imdb_id, season_number
+            ORDER BY tmdb_episode_count DESC NULLS LAST
+        ) = 1;
+
+        COPY (
+            SELECT *
+            FROM master_shows
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY imdb_id
+                ORDER BY CASE WHEN poster_path IS NOT NULL THEN 1 ELSE 0 END DESC, tmdb_id DESC
+            ) = 1
+        ) TO 'shows_master.csv.gz' (HEADER, DELIMITER ',', COMPRESSION 'gzip');
+
+        COPY (
+            SELECT *
+            FROM master_seasons
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY show_imdb_id, season_number
+                ORDER BY tmdb_episode_count DESC NULLS LAST
+            ) = 1
+        ) TO 'seasons_master.csv.gz' (HEADER, DELIMITER ',', COMPRESSION 'gzip');
     """
     )
     conn.close()
@@ -496,9 +530,6 @@ async def run_incremental(since_date):
     print("[+] Incremental show update complete.", flush=True)
 
 
-# ==========================================
-# 3. MERGE & REFRESH IMDB RATINGS (SEASON 0 INCLUDED)
-# ==========================================
 def run_merge(
     shows_pattern="show_shards/shows_shard_*.csv.gz",
     seasons_pattern="show_shards/seasons_shard_*.csv.gz",
@@ -549,7 +580,15 @@ def run_merge(
                 r.numVotes AS imdb_votes,
                 ep.total_episodes AS imdb_total_episodes,
                 ep.total_time_taken_minutes AS imdb_total_time_taken_minutes
-            FROM read_csv_auto('{shows_pattern}') s
+            FROM (
+                SELECT *
+                FROM read_csv_auto('{shows_pattern}')
+                WHERE imdb_id IS NOT NULL AND TRIM(imdb_id) != ''
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY imdb_id
+                    ORDER BY CASE WHEN poster_path IS NOT NULL THEN 1 ELSE 0 END DESC, tmdb_id DESC
+                ) = 1
+            ) s
             LEFT JOIN read_csv('title.ratings.tsv.gz', delim='\\t', nullstr='\\\\N') r ON s.imdb_id = r.tconst
             LEFT JOIN ep_stats ep ON s.imdb_id = ep.parentTconst
         ) TO 'shows.csv.gz' (HEADER, COMPRESSION 'gzip');
@@ -560,14 +599,22 @@ def run_merge(
                 sr.season_imdb_rating,
                 sr.season_imdb_votes,
                 sr.season_imdb_episodes
-            FROM read_csv_auto('{seasons_pattern}') sn
+            FROM (
+                SELECT *
+                FROM read_csv_auto('{seasons_pattern}')
+                WHERE show_imdb_id IS NOT NULL AND season_number IS NOT NULL
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY show_imdb_id, season_number
+                    ORDER BY tmdb_episode_count DESC NULLS LAST
+                ) = 1
+            ) sn
             LEFT JOIN season_ratings sr ON sn.show_imdb_id = sr.parentTconst AND sn.season_number = sr.seasonNumber
         ) TO 'seasons.csv.gz' (HEADER, COMPRESSION 'gzip');
     """
     conn.execute(query)
     conn.close()
     print("[+] Successfully generated shows.csv.gz and seasons.csv.gz!", flush=True)
-
+    
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "merge":

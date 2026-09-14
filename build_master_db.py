@@ -9,16 +9,45 @@ print(
 if os.path.exists("media.sqlite"):
     os.remove("media.sqlite")
 
-# 1. Use DuckDB for fast CSV loading into SQLite
+# 1. Use DuckDB for fast CSV loading into SQLite with deduplication
 conn = duckdb.connect()
 conn.execute("INSTALL sqlite; LOAD sqlite;")
 conn.execute("ATTACH 'media.sqlite' AS sqlite_db (TYPE SQLITE);")
 
 print("[*] Ingesting CSV datasets into SQLite tables...", flush=True)
 conn.execute("""
-    CREATE TABLE sqlite_db.movies AS SELECT * FROM 'movies.csv.gz';
-    CREATE TABLE sqlite_db.shows AS SELECT * FROM 'shows.csv.gz';
-    CREATE TABLE sqlite_db.seasons AS SELECT * FROM 'seasons.csv.gz';
+    CREATE TABLE sqlite_db.movies AS
+    SELECT *
+    FROM 'movies.csv.gz'
+    WHERE imdb_id IS NOT NULL AND TRIM(imdb_id) != ''
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY imdb_id
+        ORDER BY
+            CASE WHEN poster_path IS NOT NULL AND poster_path != '' THEN 1 ELSE 0 END DESC,
+            CASE WHEN description IS NOT NULL AND description != '' THEN 1 ELSE 0 END DESC,
+            tmdb_id DESC
+    ) = 1;
+
+    CREATE TABLE sqlite_db.shows AS
+    SELECT *
+    FROM 'shows.csv.gz'
+    WHERE imdb_id IS NOT NULL AND TRIM(imdb_id) != ''
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY imdb_id
+        ORDER BY
+            CASE WHEN poster_path IS NOT NULL AND poster_path != '' THEN 1 ELSE 0 END DESC,
+            CASE WHEN description IS NOT NULL AND description != '' THEN 1 ELSE 0 END DESC,
+            tmdb_id DESC
+    ) = 1;
+
+    CREATE TABLE sqlite_db.seasons AS
+    SELECT *
+    FROM 'seasons.csv.gz'
+    WHERE show_imdb_id IS NOT NULL AND season_number IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY show_imdb_id, season_number
+        ORDER BY tmdb_episode_count DESC NULLS LAST
+    ) = 1;
 """)
 
 # 2. Attach Anime database if present and copy tables

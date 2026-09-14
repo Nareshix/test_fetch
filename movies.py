@@ -328,7 +328,6 @@ async def get_changed_movie_ids(session, start_date, end_date):
     print(f"[+] Found {len(changed_ids):,} modified/new movie IDs.", flush=True)
     return list(changed_ids)
 
-
 async def run_incremental(since_date):
     today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     delta_db = "movies_delta.duckdb"
@@ -383,10 +382,30 @@ async def run_incremental(since_date):
         FROM 'movies_master.csv.gz';
 
         ATTACH 'movies_delta.duckdb' AS delta_db;
-        DELETE FROM master_movies WHERE tmdb_id IN (SELECT tmdb_id FROM delta_db.movies);
-        INSERT INTO master_movies SELECT * FROM delta_db.movies;
 
-        COPY master_movies TO 'movies_master.csv.gz' (HEADER, DELIMITER ',', COMPRESSION 'gzip');
+        -- Remove existing matches by both tmdb_id and imdb_id
+        DELETE FROM master_movies
+        WHERE tmdb_id IN (SELECT tmdb_id FROM delta_db.movies)
+           OR imdb_id IN (SELECT imdb_id FROM delta_db.movies WHERE imdb_id IS NOT NULL);
+
+        INSERT INTO master_movies
+        SELECT *
+        FROM delta_db.movies
+        WHERE imdb_id IS NOT NULL AND TRIM(imdb_id) != ''
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY imdb_id
+            ORDER BY CASE WHEN poster_path IS NOT NULL THEN 1 ELSE 0 END DESC, tmdb_id DESC
+        ) = 1;
+
+        -- Write back deduplicated master
+        COPY (
+            SELECT *
+            FROM master_movies
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY imdb_id
+                ORDER BY CASE WHEN poster_path IS NOT NULL THEN 1 ELSE 0 END DESC, tmdb_id DESC
+            ) = 1
+        ) TO 'movies_master.csv.gz' (HEADER, DELIMITER ',', COMPRESSION 'gzip');
     """
     )
     conn.close()
@@ -395,9 +414,6 @@ async def run_incremental(since_date):
     print("[+] Incremental movie update complete.", flush=True)
 
 
-# ==========================================
-# 3. MERGE & REFRESH IMDB RATINGS
-# ==========================================
 def run_merge(input_pattern="movie_shards/movies_shard_*.csv.gz"):
     ratings_url = "https://datasets.imdbws.com/title.ratings.tsv.gz"
     ratings_file = "title.ratings.tsv.gz"
@@ -419,7 +435,15 @@ def run_merge(input_pattern="movie_shards/movies_shard_*.csv.gz"):
                 m.prod_studio, m.prod_studio_id, m.prod_studio_image_path,
                 r.averageRating AS imdb_rating,
                 r.numVotes AS imdb_votes
-            FROM read_csv_auto('{input_pattern}') m
+            FROM (
+                SELECT *
+                FROM read_csv_auto('{input_pattern}')
+                WHERE imdb_id IS NOT NULL AND TRIM(imdb_id) != ''
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY imdb_id
+                    ORDER BY CASE WHEN poster_path IS NOT NULL THEN 1 ELSE 0 END DESC, tmdb_id DESC
+                ) = 1
+            ) m
             LEFT JOIN read_csv('{ratings_file}', delim='\\t', nullstr='\\\\N') r
                 ON m.imdb_id = r.tconst
         ) TO '{output_file}' (HEADER, COMPRESSION 'gzip');
@@ -427,8 +451,7 @@ def run_merge(input_pattern="movie_shards/movies_shard_*.csv.gz"):
     conn.execute(query)
     conn.close()
     print(f"[+] Successfully refreshed {output_file}!", flush=True)
-
-
+    
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "merge":
         pattern = (
